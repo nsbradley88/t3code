@@ -9,6 +9,11 @@ T3 Connect makes an environment available to your other devices without setting
 up router forwarding. In the desktop app on the host, open **Settings →
 Sharing & access**, sign in, and enable **T3 Connect** for that environment.
 
+For a source-built desktop app, copy `.env.example` to `.env` in the repository
+root before building. It supplies the public Clerk and relay identifiers used
+by official releases. Without them, the build hides T3 Connect's sign-in
+controls. The example contains no account credentials or server-side secrets.
+
 For a command-line host, run:
 
 ```bash
