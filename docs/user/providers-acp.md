@@ -5,7 +5,7 @@ T3 Code can run installed ACP commands or coding agents from the official
 own models, tools, and sign-in, while T3 Code provides projects, threads, checkpoints, and task
 delegation.
 
-Agents that T3 Code supports as their own providers, such as Codex, Claude, Cursor, Grok, OpenCode,
+Agents that T3 Code supports as their own providers, such as Codex, Claude, Cursor, GitHub Copilot, Grok, OpenCode,
 Pi, and [Antigravity](./providers-antigravity.md), don't appear in the Registry list. Enable them in
 **Settings → Providers** instead.
 
@@ -17,6 +17,31 @@ the same generic integration.
 Claude Agent uses the ACP v2 preview by default for Registry and local `claude-agent-acp`
 commands. If you encounter preview issues, set `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2=0` in the
 provider instance's environment overrides to use ACP v1.
+
+## GitHub Copilot
+
+Install [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli),
+then enable **GitHub Copilot** in **Settings → Providers**. Use **Sign in** there,
+or run `copilot login` on the environment hosting T3 Code. T3 uses the CLI's
+authentication and credential store; you do not need to copy a token into T3.
+If the CLI is not on the server's `PATH`, set its **Binary path**.
+On Windows, T3 automatically finds the native `copilot.exe` behind a standard
+npm-installed `copilot` command. For an explicit **Binary path** override, use
+the native `copilot.exe`, not the `copilot.cmd` wrapper. T3 launches ACP commands
+directly without a shell.
+
+For GitHub Enterprise Cloud with data residency, set **GitHub host** to your
+enterprise hostname (for example, `example.ghe.com`) before signing in. T3 uses
+that host for both login and Copilot requests. Use `github.com` for a standard
+GitHub account. Enter the hostname only, without `https://` or a path.
+GitHub Enterprise Server hosts are not supported by Copilot CLI.
+From a terminal, the equivalent login is
+`copilot login --host https://example.ghe.com`.
+
+Copilot's account models, commands, and permissions run through its ACP interface.
+Multiple instances share the CLI login unless you isolate them using the CLI's
+own configuration. Copilot does not supply T3's app-owned text generation, such
+as commit messages and thread titles; choose another provider for those actions.
 
 ## Add an agent
 

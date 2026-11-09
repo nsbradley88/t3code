@@ -33,6 +33,31 @@ function settingsWith(overrides: Partial<ServerSettings>): ServerSettings {
 }
 
 describe("deriveProviderInstanceConfigMap", () => {
+  it("keeps Copilot disabled by default without overriding saved or project enablement", () => {
+    const copilot = ProviderInstanceId.make("copilot");
+    const driver = ProviderDriverKind.make("copilot");
+    const defaults = settingsWith({ providerInstances: {} });
+    expect(deriveProviderInstanceConfigMap(defaults)[copilot]).toEqual({
+      driver,
+      enabled: false,
+    });
+    for (const enabled of [true, false]) {
+      const instance = { driver, enabled, config: { githubHost: "example.ghe.com" } };
+      const configured = settingsWith({ providerInstances: { [copilot]: instance } });
+      expect(deriveProviderInstanceConfigMap(configured)[copilot]).toBe(instance);
+    }
+    const projectEnabled = {
+      ...defaults,
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [copilot]: { enabled: true } } },
+      },
+    };
+    expect(deriveProviderInstanceConfigMap(projectEnabled)[copilot]).toEqual({
+      driver,
+      enabled: true,
+    });
+  });
+
   it("turns a machine-disabled instance on when a project enables it", () => {
     const settings = settingsWith({
       providerInstances: {

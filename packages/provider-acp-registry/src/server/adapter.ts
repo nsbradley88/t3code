@@ -63,10 +63,10 @@ import {
 export const ACP_REGISTRY_PROVIDER = ProviderDriverKind.make("acpRegistry");
 export const ACP_REGISTRY_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(ACP_REGISTRY_PROVIDER);
 
-const DEFAULT_ACP_REGISTRY_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({});
 const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
 
 export interface AcpRegistryAdapterV2Options {
+  readonly driverKind?: ProviderDriverKind;
   readonly instanceId: Parameters<typeof makeAcpAdapterV2>[0]["instanceId"];
   readonly settings: AcpRegistrySettings;
   readonly environment: NodeJS.ProcessEnv;
@@ -189,6 +189,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   const isDevin = registryAgentId === "devin";
   // Local installs launch the `copilot` binary directly with no registry id.
   const isCopilot =
+    options.driverKind === "copilot" ||
     registryAgentId === "github-copilot-cli" ||
     (options.settings.source === "local" &&
       /^copilot(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
@@ -210,7 +211,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     : options;
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const flavor: AcpAdapterV2Flavor = {
-    driver: ACP_REGISTRY_PROVIDER,
+    driver: options.driverKind ?? ACP_REGISTRY_PROVIDER,
     // Cancelling a Copilot prompt also kills the background agents it started.
     capabilities: isCopilot
       ? {
@@ -319,44 +320,59 @@ export type AcpRegistryAdapterV2DriverEnv =
   | ProviderEventLoggers.ProviderEventLoggers
   | ProviderHost.ProviderHost;
 
-export const AcpRegistryAdapterV2Driver: ProviderAdapterDriver<
-  AcpRegistrySettings,
-  AcpRegistryAdapterV2DriverEnv
-> = {
-  driverKind: ACP_REGISTRY_PROVIDER,
-  configSchema: AcpRegistrySettings,
-  defaultConfig: (): AcpRegistrySettings => DEFAULT_ACP_REGISTRY_SETTINGS,
-  create: Effect.fn("AcpRegistryAdapterV2Driver.create")(
-    function* (input: ProviderAdapterDriverCreateInput<AcpRegistrySettings>) {
-      const hostEnvironment = yield* HostProcess.Environment;
-      const selfInvocation = yield* resolveSelfInvocation();
-      const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
-      const makeNativeLogger = yield* makeAcpNativeLoggerFactory();
-      return yield* makeAcpRegistryAdapterV2({
-        instanceId: input.instanceId,
-        settings: { ...input.config, enabled: input.enabled },
-        environment: yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
-        selfInvocation,
-        continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
-        nativeLogging: (threadId) =>
-          makeNativeLogger({
-            nativeEventLogger: providerEventLoggers.native,
-            provider: ACP_REGISTRY_PROVIDER,
-            threadId,
-          }),
-      });
-    },
-    (effect, input) =>
-      effect.pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterDriverCreateError({
-              driver: ACP_REGISTRY_PROVIDER,
-              instanceId: input.instanceId,
-              detail: "Failed to create ACP Registry adapter.",
-              cause,
+export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>(
+  driverKind: ProviderDriverKind,
+  configSchema: Schema.Codec<Config, unknown>,
+  configureEnvironment: (config: Config, environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv = (
+    _config,
+    environment,
+  ) => environment,
+): ProviderAdapterDriver<Config, AcpRegistryAdapterV2DriverEnv> {
+  return {
+    driverKind,
+    configSchema,
+    defaultConfig: () => Schema.decodeSync(configSchema)({}),
+    create: Effect.fn("AcpRegistryAdapterV2Driver.create")(
+      function* (input: ProviderAdapterDriverCreateInput<Config>) {
+        const hostEnvironment = yield* HostProcess.Environment;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
+        const makeNativeLogger = yield* makeAcpNativeLoggerFactory();
+        return yield* makeAcpRegistryAdapterV2({
+          driverKind,
+          instanceId: input.instanceId,
+          settings: { ...input.config, enabled: input.enabled },
+          environment: configureEnvironment(
+            input.config,
+            yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+          ),
+          selfInvocation,
+          continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
+          nativeLogging: (threadId) =>
+            makeNativeLogger({
+              nativeEventLogger: providerEventLoggers.native,
+              provider: driverKind,
+              threadId,
             }),
+        });
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterDriverCreateError({
+                driver: driverKind,
+                instanceId: input.instanceId,
+                detail: "Failed to create ACP Registry adapter.",
+                cause,
+              }),
+          ),
         ),
-      ),
-  ),
-};
+    ),
+  };
+}
+
+export const AcpRegistryAdapterV2Driver = makeAcpRegistryAdapterDriver(
+  ACP_REGISTRY_PROVIDER,
+  AcpRegistrySettings,
+);

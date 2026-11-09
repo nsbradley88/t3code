@@ -58,7 +58,11 @@ export const deriveProviderInstanceConfigMap = (
     if (driver.metadata.hasDefaultInstance === false) continue;
     const instanceId = defaultInstanceIdForDriver(driver.driverKind);
     if (instanceId in merged) continue;
-    merged[instanceId] = { driver: driver.driverKind };
+    const defaultEnabled = providerInstanceConfigEnabledFlag(driver.defaultConfig());
+    merged[instanceId] = {
+      driver: driver.driverKind,
+      ...(defaultEnabled === false ? { enabled: false } : {}),
+    };
   }
 
   // Probe project-enabled instances even if disabled machine-wide; project threads can still route to them.

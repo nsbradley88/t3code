@@ -112,6 +112,8 @@ interface AuthMethodBase {
 export type AuthMethod =
   | (AuthMethodBase & {
       readonly type: "terminal";
+      /** Legacy terminal-auth extensions can advertise a separate login executable. */
+      readonly command?: string;
       readonly args?: ReadonlyArray<string>;
       readonly env?: Readonly<Record<string, string>>;
     })

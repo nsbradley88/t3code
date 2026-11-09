@@ -379,6 +379,71 @@ describe("AcpRegistrySupport", () => {
     ),
   );
 
+  it.effect.each([
+    { architecture: "x64" as const, hoisted: false },
+    { architecture: "arm64" as const, hoisted: false },
+    { architecture: "x64" as const, hoisted: true },
+  ])("resolves the native Copilot binary behind an npm PATH shim", ({ architecture, hoisted }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cacheDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-copilot-npm-" });
+      const binDir = path.join(cacheDir, "npm");
+      const scope = path.join(binDir, "node_modules", "@github");
+      const native = path.join(
+        hoisted ? scope : path.join(scope, "copilot", "node_modules", "@github"),
+        `copilot-win32-${architecture}`,
+        "copilot.exe",
+      );
+      yield* fs.makeDirectory(path.dirname(native), { recursive: true });
+      yield* fs.writeFileString(path.join(binDir, "copilot.cmd"), "@echo off\n");
+      yield* fs.writeFileString(native, "MZ");
+      const environment = {
+        PATH: binDir,
+        PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        COPILOT_GH_HOST: "example.ghe.com",
+      };
+      const resolver = yield* AcpRegistrySupport.makeAcpRegistryCatalog({
+        cacheDir,
+        toolsDir: path.join(cacheDir, "tools"),
+        registryUrl,
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(HostProcess.Architecture, architecture),
+        Effect.provideService(SpawnExecutableResolution, () => path.join(binDir, "copilot.cmd")),
+      );
+      const local = decodeAcpRegistrySettings({
+        source: "local",
+        commandPath: "copilot",
+        commandArgs: ["--acp"],
+      });
+      expect(yield* resolver.inspect(local, environment)).toMatchObject({ status: "ready" });
+      expect((yield* resolver.resolve(local, cacheDir, environment)).spawn).toEqual({
+        command: native,
+        args: ["--acp"],
+        cwd: cacheDir,
+        env: environment,
+        shell: false,
+      });
+      expect(
+        yield* resolver
+          .inspect({ ...local, commandPath: path.join(binDir, "copilot.cmd") }, environment)
+          .pipe(Effect.flip),
+      ).toMatchObject({ reason: "runner_unavailable" });
+      yield* fs.remove(native);
+      expect(yield* resolver.inspect(local, environment).pipe(Effect.flip)).toMatchObject({
+        reason: "runner_unavailable",
+      });
+      yield* fs.makeDirectory(native);
+      expect(yield* resolver.inspect(local, environment).pipe(Effect.flip)).toMatchObject({
+        reason: "runner_unavailable",
+      });
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerResolver(() => Effect.die("unexpected registry request"))),
+    ),
+  );
+
   it.effect("resolves command overrides while preserving registry args and environment", () => {
     const agent = makeAgent({
       binary: {

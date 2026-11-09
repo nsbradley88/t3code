@@ -1,7 +1,22 @@
 import { ProviderDriverKind } from "@t3tools/contracts";
 import { defineProviderClient } from "@t3tools/provider-core/client";
 
-import { AcpRegistrySettings } from "./settings.ts";
+import { AcpRegistrySettings, CopilotSettings } from "./settings.ts";
+
+export const copilotClient = defineProviderClient({
+  driverKind: ProviderDriverKind.make("copilot"),
+  label: "GitHub Copilot",
+  settingsSchema: CopilotSettings,
+  acpRegistryAgentIds: ["github-copilot-cli"],
+  environmentFields: [
+    {
+      name: "COPILOT_GITHUB_TOKEN",
+      label: "Copilot token",
+      description: "Optional. Use CLI sign-in instead to keep credentials in Copilot's own store.",
+      sensitive: true,
+    },
+  ],
+});
 
 export const acpRegistryClient = defineProviderClient({
   driverKind: ProviderDriverKind.make("acpRegistry"),

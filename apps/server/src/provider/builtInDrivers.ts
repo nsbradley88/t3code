@@ -1,5 +1,6 @@
 import {
   AcpRegistryDriver,
+  CopilotDriver,
   type AcpRegistryDriverEnv,
 } from "@t3tools/provider-acp-registry/server";
 import { AntigravityDriver, type AntigravityDriverEnv } from "./Drivers/AntigravityDriver.ts";
@@ -34,6 +35,7 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   CodexDriver,
   ClaudeDriver,
   CursorDriver,
+  CopilotDriver,
   GrokDriver,
   FxDriver,
   OpenCodeDriver,

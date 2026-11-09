@@ -63,7 +63,7 @@ export function ProviderAuthenticationSection({
     provider.auth.status === "authenticated" ||
     (provider.auth.status === "unknown" && auth?.phase === "succeeded");
   const isDiscovering =
-    provider.driver === "acpRegistry" &&
+    (provider.driver === "acpRegistry" || provider.driver === "copilot") &&
     !active &&
     !signedIn &&
     !query.error &&
@@ -72,7 +72,8 @@ export function ProviderAuthenticationSection({
     !active &&
     !signedIn &&
     (provider.setup?.canAuthenticate === false ||
-      (provider.driver === "acpRegistry" && auth?.methods?.length === 0));
+      ((provider.driver === "acpRegistry" || provider.driver === "copilot") &&
+        auth?.methods?.length === 0));
   const usesCredentials =
     provider.driver === "antigravity" &&
     (provider.auth.type === "gemini-api-key" || provider.auth.type === "agent-platform");

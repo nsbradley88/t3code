@@ -2,19 +2,30 @@ import { RegistryContext } from "@effect/atom-react";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  AuthSettingsWriteScope,
+  DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  resolveProviderInstanceEnabled,
   type AgentSessionProjectCandidate,
   type AuthEnvironmentScope,
   type AuthSessionState,
+  type ProviderAuthState,
+  type ServerConfig,
+  type ServerProvider,
+  type ServerSettings,
 } from "@t3tools/contracts";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
+import { page, userEvent } from "vite-plus/test/browser";
 
 import "~/index.css";
 import { act, render } from "../../../test/render";
 
 type SessionResult = AsyncResult.AsyncResult<AuthSessionState, Error>;
+type OnboardingConfig = Pick<ServerConfig, "settings" | "managedPolicy">;
 type Project = { id: ProjectId; environmentId: EnvironmentId; workspaceRoot: string };
 type CreateProjectInput = {
   environmentId: EnvironmentId;
@@ -27,10 +38,14 @@ const state = vi.hoisted(() => ({
   projects: null as unknown,
   providers: null as unknown,
   config: null as unknown,
+  configs: new Map<EnvironmentId, unknown>(),
+  auth: null as unknown,
   candidates: [] as AgentSessionProjectCandidate[],
   createProject: vi.fn(),
   importThreads: vi.fn(),
   refreshProviders: vi.fn(),
+  updateSettings: vi.fn(),
+  startProviderAuth: vi.fn(),
   connectPairing: vi.fn(),
   completeOnboarding: vi.fn(),
   onDone: vi.fn(),
@@ -80,8 +95,11 @@ vi.mock(import("../../state/server"), async (original) => {
     serverEnvironment: {
       ...actual.serverEnvironment,
       providersValueAtom: (() => state.providers) as never,
-      configValueAtom: (() => state.config) as never,
+      configValueAtom: ((id: EnvironmentId) => state.configs.get(id) ?? state.config) as never,
+      providerAuthState: (() => state.auth) as never,
       refreshProviders: "refreshProviders" as never,
+      updateSettings: "updateSettings" as never,
+      startProviderAuth: "startProviderAuth" as never,
     },
   };
 });
@@ -123,7 +141,13 @@ vi.mock(import("../../connection/onboarding"), async (original) => ({
 vi.mock(import("../../state/use-atom-command"), async (original) => ({
   ...(await original()),
   useAtomCommand: ((
-    command: "createProject" | "importThreads" | "refreshProviders" | "connectPairing",
+    command:
+      | "createProject"
+      | "importThreads"
+      | "refreshProviders"
+      | "connectPairing"
+      | "updateSettings"
+      | "startProviderAuth",
   ) => state[command]) as never,
 }));
 vi.mock(import("../settings/ChatGptWelcomeCoordinator"), async (original) => ({
@@ -263,6 +287,7 @@ async function mountImport(remote = false) {
 function setup() {
   const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
   state.addedEnvironments = [];
+  state.configs.clear();
   state.sessions.clear();
   for (const id of [primaryId, remoteId]) {
     state.sessions.set(
@@ -273,8 +298,9 @@ function setup() {
     );
   }
   state.projects = Atom.make<ReadonlyArray<Project>>([]).pipe(Atom.keepAlive);
-  state.providers = Atom.make<ReadonlyArray<never>>([]).pipe(Atom.keepAlive);
+  state.providers = Atom.make<ReadonlyArray<ServerProvider>>([]).pipe(Atom.keepAlive);
   state.config = Atom.make(null).pipe(Atom.keepAlive);
+  state.auth = Atom.make(AsyncResult.initial<ProviderAuthState>()).pipe(Atom.keepAlive);
   state.candidates = [candidate("/projects/first"), candidate("/projects/second")];
   state.createProject
     .mockReset()
@@ -283,6 +309,8 @@ function setup() {
     .mockReset()
     .mockResolvedValue(AsyncResult.success({ importedCount: 1, skippedCount: 0 }));
   state.refreshProviders.mockReset().mockResolvedValue(AsyncResult.success(undefined));
+  state.updateSettings.mockReset();
+  state.startProviderAuth.mockReset();
   state.connectPairing.mockReset().mockResolvedValue(AsyncResult.success(remoteId));
   state.completeOnboarding.mockReset().mockResolvedValue(undefined);
   state.onDone.mockReset();
@@ -291,6 +319,177 @@ function setup() {
   state.waitForProject.mockReset().mockImplementation(waitForRecordedProject);
   return now;
 }
+
+it("connects Copilot on the selected computer without losing its host or binary path", async () => {
+  using _now = setup();
+  state.selectedEnvironment = "remote";
+  const instanceId = ProviderInstanceId.make("copilot");
+  const driver = ProviderDriverKind.make("copilot");
+  const binaryPath = "C:\\Tools\\GitHub Copilot\\copilot.exe";
+  const updatedBinaryPath = "C:\\Tools\\Copilot Native\\copilot.exe";
+  const providers = state.providers as Atom.Writable<ReadonlyArray<ServerProvider>>;
+  const auth = state.auth as Atom.Writable<AsyncResult.AsyncResult<ProviderAuthState>>;
+  const remoteConfig = Atom.make<OnboardingConfig>({
+    settings: {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver, config: { enabled: false, commandPath: binaryPath } },
+      },
+    },
+    managedPolicy: {
+      organization: "Example Corp",
+      lockedSettings: [],
+      limits: { providers: { allowedDrivers: [driver] } },
+    },
+  }).pipe(Atom.keepAlive);
+  const primaryConfig = Atom.make<OnboardingConfig>({
+    settings: DEFAULT_SERVER_SETTINGS,
+  }).pipe(Atom.keepAlive);
+  state.configs.set(remoteId, remoteConfig);
+  state.configs.set(primaryId, primaryConfig);
+  appAtomRegistry.set(
+    sessionAtom(remoteId),
+    AsyncResult.success(session([AuthSettingsWriteScope])),
+  );
+  const copilot: ServerProvider = {
+    instanceId,
+    driver,
+    enabled: false,
+    installed: true,
+    version: "test-version",
+    status: "disabled",
+    auth: { status: "unauthenticated" },
+    checkedAt: "2026-11-09T00:00:00.000Z",
+    models: [],
+    skills: [],
+    slashCommands: [],
+    setup: { canAuthenticate: true, canInstall: false },
+  };
+  appAtomRegistry.set(providers, [copilot]);
+  const idleAuth: ProviderAuthState = {
+    instanceId,
+    phase: "idle",
+    flowId: null,
+    authorizationUrl: null,
+    expiresAt: null,
+    message: null,
+    methods: [{ id: "github", name: "GitHub", description: null, type: "agent" }],
+  };
+  appAtomRegistry.set(auth, AsyncResult.success(idleAuth));
+  state.updateSettings.mockImplementation(
+    async ({
+      environmentId,
+      input,
+    }: {
+      environmentId: EnvironmentId;
+      input: { patch: Partial<ServerSettings> };
+    }) => {
+      const config = state.configs.get(environmentId) as Atom.Writable<OnboardingConfig>;
+      const current = appAtomRegistry.get(config);
+      appAtomRegistry.set(config, {
+        ...current,
+        settings: { ...current.settings, ...input.patch },
+      });
+      return AsyncResult.success(undefined);
+    },
+  );
+  state.refreshProviders.mockImplementation(
+    async ({ environmentId }: { environmentId: EnvironmentId }) => {
+      const config = state.configs.get(environmentId) as Atom.Writable<OnboardingConfig>;
+      const instance = appAtomRegistry.get(config).settings.providerInstances[instanceId];
+      const enabled = instance !== undefined && resolveProviderInstanceEnabled(instance);
+      appAtomRegistry.set(providers, [
+        { ...copilot, enabled, status: enabled ? "error" : "disabled" },
+      ]);
+      return AsyncResult.success(undefined);
+    },
+  );
+  state.startProviderAuth.mockImplementation(async () => {
+    appAtomRegistry.set(
+      auth,
+      AsyncResult.success({
+        ...idleAuth,
+        phase: "waiting",
+        flowId: "copilot-sign-in",
+        interaction: {
+          type: "deviceCode",
+          id: "github-device-code",
+          url: "https://example.ghe.com/login/device",
+          userCode: "ABCD-EFGH",
+        },
+      }),
+    );
+    return AsyncResult.success(undefined);
+  });
+  await using _screen = await render(
+    <RegistryContext.Provider value={appAtomRegistry}>
+      <WelcomeWizard localAvailable={false} resumeEnvironmentId={remoteId} onDone={state.onDone} />
+    </RegistryContext.Provider>,
+  );
+  const setupSection = page.getByRole("region", { name: "GitHub Copilot setup" });
+  await expect.element(page.getByRole("heading", { name: "Connect your agents" })).toBeVisible();
+  await expect.element(setupSection).toBeVisible();
+  await expect
+    .element(setupSection.getByRole("button", { name: "Sign in", exact: true }))
+    .not.toBeInTheDocument();
+
+  const host = setupSection.getByRole("textbox", { name: "GitHub host" });
+  const binary = setupSection.getByRole("textbox", { name: "Binary path" });
+  const toggle = setupSection.getByRole("switch", { name: "Enable GitHub Copilot" });
+  await userEvent.fill(host, "example.ghe.com");
+  await userEvent.keyboard("{Enter}");
+  await vi.waitFor(() =>
+    expect(
+      appAtomRegistry.get(remoteConfig).settings.providerInstances[instanceId]?.config,
+    ).toEqual({
+      enabled: false,
+      commandPath: binaryPath,
+      githubHost: "example.ghe.com",
+    }),
+  );
+  await toggle.click();
+  await expect
+    .element(setupSection.getByRole("button", { name: "Sign in", exact: true }))
+    .toBeEnabled();
+  await expect.element(setupSection.getByText("Sign in on remote.")).toBeVisible();
+  expect(appAtomRegistry.get(remoteConfig).settings.providerInstances[instanceId]).toEqual({
+    driver,
+    enabled: true,
+    config: { enabled: true, commandPath: binaryPath, githubHost: "example.ghe.com" },
+  });
+
+  await userEvent.fill(binary, updatedBinaryPath);
+  await userEvent.keyboard("{Enter}");
+  await vi.waitFor(() =>
+    expect(
+      appAtomRegistry.get(remoteConfig).settings.providerInstances[instanceId]?.config,
+    ).toEqual({
+      enabled: true,
+      commandPath: updatedBinaryPath,
+      githubHost: "example.ghe.com",
+    }),
+  );
+  await expect.element(binary).toHaveValue(updatedBinaryPath);
+  await expect.element(host).toHaveValue("example.ghe.com");
+  await toggle.click();
+  await expect.element(toggle).not.toBeChecked();
+  await expect
+    .element(setupSection.getByRole("button", { name: "Sign in", exact: true }))
+    .not.toBeInTheDocument();
+  await toggle.click();
+  await expect
+    .element(setupSection.getByRole("button", { name: "Sign in", exact: true }))
+    .toBeEnabled();
+  await setupSection.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect.element(setupSection.getByText("ABCD-EFGH", { exact: true })).toBeVisible();
+  await expect.element(setupSection.getByRole("button", { name: "Open browser" })).toBeVisible();
+  expect(appAtomRegistry.get(remoteConfig).settings.providerInstances[instanceId]).toEqual({
+    driver,
+    enabled: true,
+    config: { enabled: true, commandPath: updatedBinaryPath, githubHost: "example.ghe.com" },
+  });
+  expect(appAtomRegistry.get(primaryConfig).settings).toEqual(DEFAULT_SERVER_SETTINGS);
+});
 
 it("keeps the project selection after going back a stage", async () => {
   using _now = setup();

@@ -20,7 +20,11 @@ import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 import * as ProviderAuthFlow from "@t3tools/provider-core/server/providerAuthFlow";
-import { normalizeAcpRegistryAuthMethods, normalizeAcpRegistryWebUrl } from "./probe.ts";
+import {
+  normalizeAcpRegistryAuthMethods,
+  normalizeAcpRegistryWebUrl,
+  resolveAcpRegistryTerminalAuthSpawn,
+} from "./probe.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -165,20 +169,22 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
     }),
   );
 
-  const methods = Option.isSome(coordinator)
-    ? coordinator.value
-        .runBackgroundProbe(agentKey, discoverMethods)
-        .pipe(
-          Effect.flatMap((result) =>
-            Effect.fromOption(result, () =>
-              failure(
-                "methods",
-                "Sign-in discovery was interrupted by an active provider session. Try again.",
+  const methods = !options.settings.enabled
+    ? Effect.succeed<ReadonlyArray<ProviderAuthMethod>>([])
+    : Option.isSome(coordinator)
+      ? coordinator.value
+          .runBackgroundProbe(agentKey, discoverMethods)
+          .pipe(
+            Effect.flatMap((result) =>
+              Effect.fromOption(result, () =>
+                failure(
+                  "methods",
+                  "Sign-in discovery was interrupted by an active provider session. Try again.",
+                ),
               ),
             ),
-          ),
-        )
-    : discoverMethods;
+          )
+      : discoverMethods;
 
   const runTerminal = Effect.fnUntraced(function* (
     resolved: AcpRegistrySupport.ResolvedAcpRegistryAgent,
@@ -192,10 +198,14 @@ export const makeAcpRegistryAuth = Effect.fn("makeAcpRegistryAuth")(function* (o
       );
     const exited = yield* Deferred.make<number>();
     const output = yield* Queue.sliding<string>(64);
+    const login = resolveAcpRegistryTerminalAuthSpawn(method, {
+      ...resolved.spawn,
+      env: { ...options.environment, ...resolved.spawn.env },
+    });
     const process = yield* pty.value
       .spawn({
-        shell: resolved.spawn.command,
-        args: [...resolved.spawn.args, ...(method.args ?? [])],
+        shell: login.command,
+        args: [...login.args],
         cwd: options.cwd,
         cols: 80,
         rows: 24,

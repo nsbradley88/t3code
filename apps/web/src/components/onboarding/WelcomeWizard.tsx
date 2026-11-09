@@ -20,7 +20,6 @@ import {
   CommandId,
   defaultInstanceIdForDriver,
   AuthOrchestrationOperateScope,
-  isManagedDriverAllowed,
   ProviderDriverKind,
   ThreadId,
 } from "@t3tools/contracts";
@@ -55,7 +54,8 @@ import {
   getOnboardingProviderState,
   resolveOnboardingProviderInstallCommand,
   resolveOnboardingProviderLoginCommand,
-  selectOnboardingProvidersByDriver,
+  ONBOARDING_AGENT_DRIVERS,
+  selectOnboardingAgents,
 } from "../../onboarding/providerReadiness.logic";
 import { newProjectId, randomUUID } from "../../lib/utils";
 import { agentSessionImport } from "../../state/agentSessions";
@@ -106,6 +106,7 @@ import { Dialog } from "../ui/dialog";
 import { toastManager } from "../ui/toast";
 import { cn } from "../../lib/utils";
 import { formatRelativeTime } from "../../timestampFormat";
+import { OnboardingCopilotSetup } from "./OnboardingCopilotSetup";
 
 type WizardStep = "connection" | "agents" | "import";
 const NO_ENVIRONMENTS: readonly EnvironmentId[] = [];
@@ -663,8 +664,7 @@ function PairingForm({
   );
 }
 
-const PRIMARY_AGENT_DRIVERS = ["codex", "claudeAgent"] as const;
-type OnboardingAgentDriver = (typeof PRIMARY_AGENT_DRIVERS)[number];
+type OnboardingAgentDriver = Exclude<(typeof ONBOARDING_AGENT_DRIVERS)[number], "copilot">;
 
 interface AgentTerminalSession {
   readonly environmentId: EnvironmentId;
@@ -738,7 +738,6 @@ function ConnectedAgentsStep({
     void refreshProviders({ environmentId, input: {} });
   }, [environmentId, refreshProviders]);
 
-  const byDriver = selectOnboardingProvidersByDriver(providers);
   const managedPolicy = serverConfig?.managedPolicy;
   // A policy that owns Codex's launch settings also rules out ChatGPT's own runtime.
   const chatGptAllowed =
@@ -746,15 +745,7 @@ function ConnectedAgentsStep({
       "setupMode",
     ) !== true;
 
-  const primaryAgents = PRIMARY_AGENT_DRIVERS.filter((driver) =>
-    isManagedDriverAllowed(managedPolicy, ProviderDriverKind.make(driver)),
-  ).flatMap((driver) => {
-    const instances =
-      driver === "codex" ? providers?.filter((provider) => provider.driver === driver) : undefined;
-    return instances?.length
-      ? instances.map((provider) => ({ driver, provider, instanceId: provider.instanceId }))
-      : [{ driver, provider: byDriver.get(driver), instanceId: byDriver.get(driver)?.instanceId }];
-  });
+  const primaryAgents = selectOnboardingAgents(providers, managedPolicy);
   if (createdAccount) {
     const index = primaryAgents.findIndex(
       (agent) => agent.instanceId === createdAccount.instanceId,
@@ -778,7 +769,15 @@ function ConnectedAgentsStep({
       ) : null}
       <div className="space-y-1.5">
         {primaryAgents.map(({ driver, provider, instanceId }) =>
-          driver === "codex" && serverConfig !== null ? (
+          driver === "copilot" ? (
+            <OnboardingCopilotSetup
+              key={instanceId ?? driver}
+              environmentId={environmentId}
+              environmentLabel={machineLabel}
+              provider={provider}
+              serverConfig={serverConfig}
+            />
+          ) : driver === "codex" && serverConfig !== null ? (
             <OnboardingCodexSetup
               key={instanceId ?? driver}
               environmentId={environmentId}

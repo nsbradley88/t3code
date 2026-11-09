@@ -826,59 +826,73 @@ it.layer(
       );
     });
 
-    it("retains ACP Registry models while discovery has not completed", () => {
-      const previousProvider = {
-        instanceId: ProviderInstanceId.make("acpRegistry_codex"),
-        driver: ProviderDriverKind.make("acpRegistry"),
-        status: "ready",
-        enabled: true,
-        installed: true,
-        auth: { status: "authenticated" },
-        checkedAt: "2026-08-13T00:00:00.000Z",
-        version: "1.2.0",
-        models: [{ slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null }],
-        slashCommands: [],
-        skills: [],
-      } as const satisfies ServerProvider;
-      const checkingProvider = {
-        ...previousProvider,
-        checkedAt: "2026-08-13T00:01:00.000Z",
-        auth: { status: "unknown" },
-        message: "Checking ACP authentication, models, and commands in the background...",
-        models: [{ slug: "default", name: "Default", isCustom: false, capabilities: null }],
-      } satisfies ServerProvider;
-      const confirmedCheckingProvider = {
-        ...checkingProvider,
-        auth: { status: "authenticated" },
-      } satisfies ServerProvider;
-      const failedProbeProvider = {
-        ...checkingProvider,
-        status: "warning",
-        message: "ACP discovery failed.",
-      } satisfies ServerProvider;
+    it.each(["acpRegistry", "copilot"])(
+      "retains %s models while discovery has not completed",
+      (driver) => {
+        const previousProvider = {
+          instanceId: ProviderInstanceId.make("acpRegistry_codex"),
+          driver: ProviderDriverKind.make(driver),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-08-13T00:00:00.000Z",
+          version: "1.2.0",
+          models: [
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+        const checkingProvider = {
+          ...previousProvider,
+          checkedAt: "2026-08-13T00:01:00.000Z",
+          auth: { status: "unknown" },
+          message: "Checking ACP authentication, models, and commands in the background...",
+          models: [{ slug: "default", name: "Default", isCustom: false, capabilities: null }],
+        } satisfies ServerProvider;
+        const confirmedCheckingProvider = {
+          ...checkingProvider,
+          auth: { status: "authenticated" },
+        } satisfies ServerProvider;
+        const failedProbeProvider = {
+          ...checkingProvider,
+          status: "warning",
+          message: "ACP discovery failed.",
+        } satisfies ServerProvider;
 
-      assert.deepStrictEqual(
-        ProviderRegistry.mergeProviderSnapshot(previousProvider, checkingProvider).models,
-        [
-          { slug: "default", name: "Default", isCustom: false, capabilities: null },
-          { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
-        ],
-      );
-      assert.deepStrictEqual(
-        ProviderRegistry.mergeProviderSnapshot(previousProvider, confirmedCheckingProvider).models,
-        [
-          { slug: "default", name: "Default", isCustom: false, capabilities: null },
-          { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
-        ],
-      );
-      assert.deepStrictEqual(
-        ProviderRegistry.mergeProviderSnapshot(previousProvider, failedProbeProvider).models,
-        [
-          { slug: "default", name: "Default", isCustom: false, capabilities: null },
-          { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
-        ],
-      );
-    });
+        assert.deepStrictEqual(
+          ProviderRegistry.mergeProviderSnapshot(previousProvider, checkingProvider).models,
+          [
+            { slug: "default", name: "Default", isCustom: false, capabilities: null },
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+        );
+        assert.deepStrictEqual(
+          ProviderRegistry.mergeProviderSnapshot(previousProvider, confirmedCheckingProvider)
+            .models,
+          [
+            { slug: "default", name: "Default", isCustom: false, capabilities: null },
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+        );
+        assert.deepStrictEqual(
+          ProviderRegistry.mergeProviderSnapshot(previousProvider, failedProbeProvider).models,
+          [
+            { slug: "default", name: "Default", isCustom: false, capabilities: null },
+            { slug: "gpt-5.6-sol", name: "GPT-5.6-Sol", isCustom: false, capabilities: null },
+          ],
+        );
+        const completedProvider = {
+          ...checkingProvider,
+          nativeSessions: { canList: true, canLoad: true, canResume: true },
+        };
+        assert.deepStrictEqual(
+          ProviderRegistry.mergeProviderSnapshot(previousProvider, completedProvider).models,
+          completedProvider.models,
+        );
+      },
+    );
 
     it("drops Grok models a completed probe no longer advertises", () => {
       const previousProvider = {

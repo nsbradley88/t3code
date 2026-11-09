@@ -1,17 +1,23 @@
-import { AcpRegistryOperationError, ProviderInstanceId } from "@t3tools/contracts";
-import { AcpRegistrySettings } from "../settings.ts";
+import {
+  AcpRegistryOperationError,
+  ProviderDriverKind,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
+import { AcpRegistrySettings, CopilotSettings } from "../settings.ts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
+import { resolveCopilotEnvironment } from "./copilotHost.ts";
 import {
   applyAcpRegistryAvailableCommands,
   applyAcpRegistryLiveConfiguration,
   buildCheckedAcpRegistrySnapshot,
   checkAcpRegistryProviderReadiness,
   checkAcpRegistryProviderStatus,
+  CopilotDriver,
 } from "./driver.ts";
 
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
@@ -43,6 +49,81 @@ function catalogWithInspection(
 }
 
 describe("acpRegistrySnapshotReadiness", () => {
+  it("keeps Copilot launch configuration local and preserves its identity through auth failures", () => {
+    const config = CopilotDriver.defaultConfig();
+    expect(config).toMatchObject({
+      enabled: false,
+      source: "local",
+      commandPath: "copilot",
+      commandArgs: ["--acp"],
+      githubHost: "github.com",
+    });
+    const decodeCopilot = Schema.decodeUnknownSync(CopilotSettings);
+    expect(() => decodeCopilot({ source: "registry" })).toThrow();
+    expect(() => decodeCopilot({ commandArgs: ["--allow-all"] })).toThrow();
+    for (const githubHost of ["github.com", "example.ghe.com", "EXAMPLE.GHE.COM"]) {
+      expect(decodeCopilot({ githubHost }).githubHost).toBe(githubHost);
+    }
+    for (const githubHost of [
+      "",
+      "*.ghe.com",
+      "https://example.ghe.com",
+      "example.ghe.com/login",
+      "example.ghe.com.evil.test",
+      "github.com@evil.test",
+      "-example.ghe.com",
+      "example-.ghe.com",
+      "git.example.internal",
+      `${"a".repeat(64)}.ghe.com`,
+    ]) {
+      expect(() => decodeCopilot({ githubHost })).toThrow();
+    }
+    const environment = {
+      GH_HOST: "git.example.internal",
+      COPILOT_GH_HOST: "old.ghe.com",
+      COPILOT_GITHUB_TOKEN: "test-token",
+    };
+    expect(
+      resolveCopilotEnvironment(decodeCopilot({ githubHost: "EXAMPLE.GHE.COM" }), environment),
+    ).toEqual({ ...environment, COPILOT_GH_HOST: "example.ghe.com" });
+    expect(resolveCopilotEnvironment(config, environment)).toEqual({
+      ...environment,
+      COPILOT_GH_HOST: "github.com",
+    });
+    expect(environment.COPILOT_GH_HOST).toBe("old.ghe.com");
+    const snapshot = buildCheckedAcpRegistrySnapshot({
+      ...identity,
+      driverKind: ProviderDriverKind.make("copilot"),
+      settings: { ...config, enabled: true },
+      checkedAt: "2026-08-13T10:00:00.000Z",
+      inspection: {
+        status: "ready",
+        agentId: "",
+        version: null,
+        distribution: "local",
+      },
+      probeError: new AcpRegistryOperationError({
+        reason: "authentication_failed",
+        message: "Authentication required.",
+        authMethods: [
+          {
+            id: "github",
+            name: "Sign in with GitHub",
+            type: "terminal",
+            description: null,
+            command: "copilot login",
+          },
+        ],
+      }),
+    });
+    expect(snapshot).toMatchObject({
+      driver: "copilot",
+      installed: true,
+      setup: { canAuthenticate: true },
+      auth: { status: "unauthenticated", label: "Sign in with GitHub" },
+    });
+  });
+
   it("treats a live empty command advertisement as an authoritative replacement", () => {
     const provider = buildCheckedAcpRegistrySnapshot({
       ...identity,

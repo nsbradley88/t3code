@@ -11,6 +11,7 @@ import {
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
+import { resolveCopilotLoginArgs } from "./copilotHost.ts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -96,6 +97,18 @@ function normalizeModels(
 export interface AcpRegistryAuthSpawnContext {
   readonly command: string;
   readonly args: ReadonlyArray<string>;
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export function resolveAcpRegistryTerminalAuthSpawn(
+  method: Extract<EffectAcpSchema.AuthMethod, { readonly type: "terminal" }>,
+  spawn: AcpRegistryAuthSpawnContext,
+): AcpRegistryAuthSpawnContext {
+  const args = [...(method.command === undefined ? spawn.args : []), ...(method.args ?? [])];
+  return {
+    command: method.command ?? spawn.command,
+    args: method.id === "copilot-login" ? resolveCopilotLoginArgs(args, spawn.env ?? {}) : args,
+  };
 }
 
 const SHELL_SAFE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/u;
@@ -111,7 +124,8 @@ function terminalAuthCommand(
   const environmentPrefix = Object.entries(method.env ?? {}).map(
     ([name, value]) => `${name}=${shellDisplayToken(value)}`,
   );
-  const command = [spawn.command, ...spawn.args, ...(method.args ?? [])].map(shellDisplayToken);
+  const login = resolveAcpRegistryTerminalAuthSpawn(method, spawn);
+  const command = [login.command, ...login.args].map(shellDisplayToken);
   const displayCommand = [...environmentPrefix, ...command].join(" ");
   return displayCommand.length <= MAX_COMMAND_LINE_LENGTH ? displayCommand : undefined;
 }
@@ -354,10 +368,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
           onInitialized: (initializeResult) =>
             Ref.set(
               authMethodsRef,
-              normalizeAcpRegistryAuthMethods(initializeResult.authMethods, {
-                command: resolved.spawn.command,
-                args: resolved.spawn.args,
-              }),
+              normalizeAcpRegistryAuthMethods(initializeResult.authMethods, resolved.spawn),
             ),
           ...(input.settings.authMethodId ? { authMethodId: input.settings.authMethodId } : {}),
         }).pipe(

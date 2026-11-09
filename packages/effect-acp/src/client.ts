@@ -42,6 +42,34 @@ const decodeNoticeUpdate = Schema.decodeUnknownOption(
     _meta: Schema.optionalKey(Schema.NullOr(Schema.Record(Schema.String, Schema.Json))),
   }),
 );
+const decodeTerminalAuthExtension = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    command: Schema.optionalKey(Schema.NonEmptyString),
+    args: Schema.optionalKey(Schema.Array(Schema.String)),
+    env: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+  }),
+);
+
+const normalizeTerminalAuthMethods = Effect.fn("AcpClient.normalizeTerminalAuthMethods")(function* (
+  response: AcpSchema.InitializeResponse,
+) {
+  if (response.authMethods === undefined) return response;
+  const authMethods = yield* Effect.forEach(response.authMethods, (method) => {
+    const extension = method._meta?.["terminal-auth"];
+    if (extension === undefined) return Effect.succeed(method);
+    return decodeTerminalAuthExtension(extension).pipe(
+      Effect.map((terminal): AcpSchema.AuthMethod => ({
+        ...method,
+        ...terminal,
+        type: "terminal",
+      })),
+      Effect.mapError((cause) =>
+        AcpError.AcpProtocolParseError.fromSchemaError("decode-wire-message", "initialize", cause),
+      ),
+    );
+  });
+  return { ...response, authMethods };
+});
 
 export interface AcpClientOptions {
   readonly logIncoming?: boolean;
@@ -1096,6 +1124,7 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
               normalized.agentCapabilities?.sessionCapabilities?.delete != null;
             return normalized;
           }),
+          Effect.flatMap(normalizeTerminalAuthMethods),
         ),
       authenticate: (payload) =>
         negotiatedProtocolGeneration === 1

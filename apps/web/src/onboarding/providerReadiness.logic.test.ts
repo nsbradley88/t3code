@@ -9,6 +9,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   getOnboardingProviderState,
   resolveOnboardingProviderLoginCommand,
+  selectOnboardingAgents,
   selectOnboardingProvidersByDriver,
 } from "./providerReadiness.logic";
 
@@ -45,6 +46,76 @@ describe("getOnboardingProviderState", () => {
         status: "warning",
       }),
     ).toBe("attention");
+  });
+
+  describe("selectOnboardingAgents", () => {
+    it("offers disabled Copilot setup alongside existing accounts and selects its ready instance", () => {
+      const disabledCopilot: ServerProvider = {
+        ...readyCodex,
+        driver: ProviderDriverKind.make("copilot"),
+        instanceId: ProviderInstanceId.make("copilot"),
+        enabled: false,
+        installed: false,
+        status: "disabled",
+      };
+      const secondCodex = { ...readyCodex, instanceId: ProviderInstanceId.make("codex_work") };
+      const agents = selectOnboardingAgents([readyCodex, secondCodex, disabledCopilot]);
+      expect(agents.map((agent) => agent.driver)).toEqual([
+        "codex",
+        "codex",
+        "claudeAgent",
+        "copilot",
+      ]);
+      expect(agents.at(-1)?.provider).toBe(disabledCopilot);
+      expect(getOnboardingProviderState(agents.at(-1)?.provider)).toBe("disabled");
+
+      const signedOutCopilot = {
+        ...disabledCopilot,
+        enabled: true,
+        installed: true,
+        status: "error" as const,
+        auth: { status: "unauthenticated" as const },
+      };
+      expect(
+        getOnboardingProviderState(selectOnboardingAgents([signedOutCopilot]).at(-1)?.provider),
+      ).toBe("signIn");
+      const readyCopilot = {
+        ...signedOutCopilot,
+        instanceId: ProviderInstanceId.make("copilot_work"),
+        status: "ready" as const,
+        auth: { status: "authenticated" as const },
+      };
+      expect(
+        selectOnboardingAgents([disabledCopilot, signedOutCopilot, readyCopilot]).at(-1)?.provider,
+      ).toBe(readyCopilot);
+      expect(getOnboardingProviderState(readyCopilot)).toBe("ready");
+      expect(selectOnboardingAgents(null).at(-1)).toEqual({
+        driver: "copilot",
+        provider: undefined,
+        instanceId: undefined,
+      });
+      expect(
+        selectOnboardingAgents([readyCodex, disabledCopilot], {
+          organization: "Example Corp",
+          lockedSettings: [],
+          limits: { providers: { allowedDrivers: [ProviderDriverKind.make("codex")] } },
+        }).map((agent) => agent.driver),
+      ).toEqual(["codex"]);
+      expect(
+        selectOnboardingAgents([disabledCopilot], {
+          organization: "Example Corp",
+          lockedSettings: [],
+          limits: {
+            providers: {
+              allowedDrivers: [ProviderDriverKind.make("copilot")],
+              lockedInstanceFields: {
+                [ProviderDriverKind.make("copilot")]: ["config.commandPath", "config.githubHost"],
+              },
+            },
+          },
+        }).at(-1)?.provider,
+      ).toBe(disabledCopilot);
+    });
   });
 
   it("offers sign-in only when the server reports an authentication failure", () => {

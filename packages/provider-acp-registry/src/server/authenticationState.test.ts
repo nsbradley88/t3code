@@ -57,6 +57,8 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("ACP sign-in conf
           { settings: { ...settings, commandPath: "/other/devin" } },
           { environment: [{ name: "DEVIN_TOKEN", value: "different-token", sensitive: true }] },
           { processEnvironment: { HOME: "/home/other" } },
+          { processEnvironment: { HOME: "/home/test", COPILOT_GH_HOST: "example.ghe.com" } },
+          { processEnvironment: { HOME: "/home/test", GH_HOST: "example.ghe.com" } },
         ]) {
           const signedIn = yield* makeAcpRegistryAuthenticationState(input);
           yield* signedIn.set(true);

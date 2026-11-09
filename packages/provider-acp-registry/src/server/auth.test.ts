@@ -63,6 +63,7 @@ const makeHarness = (
   settings = decodeSettings({ agentId: "test-agent" }),
   providerInstanceId = instanceId,
   authenticateError?: AcpRequestError,
+  environment: NodeJS.ProcessEnv = { PATH: "/tools", OVERRIDE: "base" },
 ) =>
   Effect.gen(function* () {
     const verify = yield* Deferred.make<void>();
@@ -83,7 +84,7 @@ const makeHarness = (
       instanceId: providerInstanceId,
       settings,
       cwd: "/workspace",
-      environment: { PATH: "/tools", OVERRIDE: "base" },
+      environment,
       onChanged: (value) =>
         Effect.sync(() => {
           changed.push(value);
@@ -196,7 +197,7 @@ const makeHarness = (
         .subscribe("owner")
         .pipe(Stream.filter(predicate), Stream.runHead, Effect.map(Option.getOrThrow));
     const phase = (phase: ProviderAuthState["phase"]) => state((value) => value.phase === phase);
-    yield* state((value) => (value.methods?.length ?? 0) > 0);
+    yield* state((value) => value.methods !== undefined);
     return {
       controller,
       verify,
@@ -240,6 +241,20 @@ it.effect("keeps local credentials separate from a matching registry agent ID", 
   }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
+it.effect("does not start a disabled agent to discover sign-in methods", () =>
+  Effect.gen(function* () {
+    const h = yield* makeHarness(
+      browserMethod,
+      false,
+      decodeSettings({ agentId: "test-agent", enabled: false }),
+    );
+    assert.strictEqual(h.runtimes(), 0);
+    assert.deepEqual(h.started, []);
+    assert.deepEqual(h.authenticated, []);
+    assert.deepEqual(h.closed, []);
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
 it.effect(
   "discovers methods without signing in, then waits for browser consent and session verification",
   () =>
@@ -274,21 +289,71 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
-it.effect(
+it.effect.each([
+  { method: terminalMethod, shell: "/managed/agent", args: ["--acp", "login"] },
+  {
+    method: { ...terminalMethod, command: "C:\\Program Files\\Copilot\\copilot.exe" },
+    shell: "C:\\Program Files\\Copilot\\copilot.exe",
+    args: ["login"],
+  },
+  {
+    method: {
+      ...terminalMethod,
+      id: "copilot-login",
+      command: "C:\\Program Files\\Copilot\\copilot.exe",
+    },
+    shell: "C:\\Program Files\\Copilot\\copilot.exe",
+    args: ["login", "--host", "https://example.ghe.com"],
+    host: "example.ghe.com",
+  },
+  {
+    method: {
+      ...terminalMethod,
+      id: "copilot-login",
+      command: "C:\\Program Files\\Copilot\\copilot.exe",
+      args: ["login", "--host", "https://old.ghe.com", "--device-code"],
+    },
+    shell: "C:\\Program Files\\Copilot\\copilot.exe",
+    args: ["login", "--device-code", "--host", "https://github.com"],
+    host: "github.com",
+  },
+  {
+    method: {
+      ...terminalMethod,
+      id: "copilot-login",
+      command: "C:\\Program Files\\Copilot\\copilot.exe",
+      args: ["login", "--host=https://old.ghe.com"],
+    },
+    shell: "C:\\Program Files\\Copilot\\copilot.exe",
+    args: ["login", "--host", "https://example.ghe.com"],
+    host: "example.ghe.com",
+  },
+])(
   "runs terminal auth directly with the resolved environment and reconnects to verify",
-  () =>
+  ({ method, shell, args, host }) =>
     Effect.gen(function* () {
-      const h = yield* makeHarness(terminalMethod);
-      const flow = yield* h.controller.start("owner", Effect.void, "terminal");
+      const hostEnvironment = host ? { COPILOT_GH_HOST: host } : {};
+      const h = yield* makeHarness(method, false, undefined, undefined, undefined, {
+        PATH: "/tools",
+        OVERRIDE: "base",
+        ...hostEnvironment,
+      });
+      const flow = yield* h.controller.start("owner", Effect.void, method.id);
       yield* h.phase("waiting");
       assert.isTrue(h.closedBeforeTerminal());
       assert.deepEqual(h.terminalSpawn(), {
-        shell: "/managed/agent",
-        args: ["--acp", "login"],
+        shell,
+        args,
         cwd: "/workspace",
         cols: 80,
         rows: 24,
-        env: { PATH: "/tools", OVERRIDE: "method", AGENT_HOME: "/custom/home", LOGIN: "yes" },
+        env: {
+          PATH: "/tools",
+          OVERRIDE: "method",
+          AGENT_HOME: "/custom/home",
+          LOGIN: "yes",
+          ...hostEnvironment,
+        },
       });
       h.data("Enter code: ");
       const output = yield* h.state(

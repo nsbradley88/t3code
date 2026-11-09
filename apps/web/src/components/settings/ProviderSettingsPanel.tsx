@@ -1253,7 +1253,8 @@ function ProviderInstanceRow({
   const allProjects = useProjects();
   const secretSources = useSecretSources(environmentId);
   const acpProjects =
-    mode === "editor" && liveProvider?.driver === "acpRegistry"
+    mode === "editor" &&
+    (liveProvider?.driver === "acpRegistry" || liveProvider?.driver === "copilot")
       ? allProjects.filter((project) => project.environmentId === environmentId)
       : undefined;
   const instance = explicitInstance ?? { driver };
@@ -1353,7 +1354,8 @@ function ProviderInstanceRow({
           !readOnly &&
           liveProvider &&
           (liveProvider.setup?.canAuthenticate ||
-            (liveProvider.driver === "acpRegistry" && liveProvider.installed)) ? (
+            ((liveProvider.driver === "acpRegistry" || liveProvider.driver === "copilot") &&
+              liveProvider.installed)) ? (
           <ProviderAuthenticationSection
             key={`${environmentId}:${instanceId}`}
             environmentId={environmentId}

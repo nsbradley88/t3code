@@ -52,6 +52,8 @@ export const makeAcpRegistryAuthenticationState = Effect.fn("makeAcpRegistryAuth
         "XDG_STATE_HOME",
         "APPDATA",
         "LOCALAPPDATA",
+        "COPILOT_GH_HOST",
+        "GH_HOST",
       ].map((name) => input.processEnvironment[name] ?? null),
     });
     const saved = yield* fs.readFileString(filePath).pipe(

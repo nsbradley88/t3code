@@ -782,6 +782,37 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
     }),
   );
 
+  it.effect("rejects malformed legacy terminal login metadata", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const acp = yield* AcpClient.make(stdio);
+      const initializeFiber = yield* acp.agent
+        .initialize({ protocolVersion: 1 })
+        .pipe(Effect.flip, Effect.forkScoped);
+      const request = yield* Queue.take(output).pipe(
+        Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(InitializeRequestV1))),
+      );
+      yield* Queue.offer(
+        input,
+        yield* encodeJsonl(InitializeResponseV1, {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            protocolVersion: 1,
+            authMethods: [
+              {
+                id: "copilot-login",
+                name: "Log in",
+                _meta: { "terminal-auth": { command: 3, args: ["login"] } },
+              },
+            ],
+          },
+        }),
+      );
+      assert.equal((yield* Fiber.join(initializeFiber))._tag, "AcpProtocolParseError");
+    }),
+  );
+
   it.effect.each([1, 2])("keeps legacy wire behavior with version %s", (protocolVersion) =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
@@ -812,12 +843,40 @@ it.layer(NodeServices.layer)("effect-acp client", (it) => {
           result: {
             ...antigravityInitialize,
             protocolVersion,
+            authMethods: [
+              {
+                id: "copilot-login",
+                name: "Log in with Copilot CLI",
+                _meta: {
+                  "terminal-auth": {
+                    command: "C:\\Program Files\\Copilot\\copilot.exe",
+                    args: ["login"],
+                    env: { COPILOT_HOME: "C:\\isolated" },
+                  },
+                },
+              },
+            ],
           },
         }),
       );
       const initialized = yield* Fiber.join(initializeFiber);
       assert.equal(initialized.protocolVersion, protocolVersion);
       assert.equal(initialized.agentInfo?.name, "antigravity-acp");
+      assert.deepEqual(initialized.authMethods?.[0], {
+        id: "copilot-login",
+        name: "Log in with Copilot CLI",
+        type: "terminal",
+        command: "C:\\Program Files\\Copilot\\copilot.exe",
+        args: ["login"],
+        env: { COPILOT_HOME: "C:\\isolated" },
+        _meta: {
+          "terminal-auth": {
+            command: "C:\\Program Files\\Copilot\\copilot.exe",
+            args: ["login"],
+            env: { COPILOT_HOME: "C:\\isolated" },
+          },
+        },
+      });
 
       const exchange = <A, E>(effect: Effect.Effect<A, E>, method: string) =>
         Effect.gen(function* () {

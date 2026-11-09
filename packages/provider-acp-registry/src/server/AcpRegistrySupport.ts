@@ -1710,12 +1710,48 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
         )
       : Effect.void;
 
+  const resolveLocalExecutable = Effect.fn("AcpRegistryCatalog.resolveLocalExecutable")(function* (
+    command: string,
+    environment: NodeJS.ProcessEnv,
+  ) {
+    const executable = resolveExecutable(command, platform, environment);
+    if (
+      executable === undefined ||
+      platform !== "win32" ||
+      command.toLowerCase() !== "copilot" ||
+      path.basename(executable).toLowerCase() !== "copilot.cmd"
+    ) {
+      return executable;
+    }
+    const scope = path.join(path.dirname(executable), "node_modules", "@github");
+    for (const directory of [path.join(scope, "copilot", "node_modules", "@github"), scope]) {
+      const native = path.join(directory, `copilot-win32-${architecture}`, "copilot.exe");
+      const available = yield* fileSystem.exists(native).pipe(
+        Effect.flatMap((exists) =>
+          exists
+            ? fileSystem.stat(native).pipe(Effect.map((info) => info.type === "File"))
+            : Effect.succeed(false),
+        ),
+        Effect.mapError(
+          (cause) =>
+            new AcpRegistryError({
+              reason: "runner_unavailable",
+              detail: "Could not inspect the native GitHub Copilot executable.",
+              cause,
+            }),
+        ),
+      );
+      if (available) return native;
+    }
+    return executable;
+  });
+
   const inspect: AcpRegistryCatalog["Service"]["inspect"] = Effect.fn("AcpRegistryCatalog.inspect")(
     function* (settings, environment) {
       if (settings.source === "local") {
         const command = settings.commandPath.trim();
         if (!command) return { status: "unconfigured" } as const;
-        const executable = resolveExecutable(command, platform, environment ?? hostEnvironment);
+        const executable = yield* resolveLocalExecutable(command, environment ?? hostEnvironment);
         if (executable !== undefined) yield* validateLocalExecutable(executable);
         return executable === undefined
           ? ({
@@ -1835,7 +1871,7 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
           });
         }
         const env = environment ?? hostEnvironment;
-        const command = resolveExecutable(executable, platform, env);
+        const command = yield* resolveLocalExecutable(executable, env);
         if (command === undefined) {
           return yield* new AcpRegistryError({
             reason: "runner_unavailable",

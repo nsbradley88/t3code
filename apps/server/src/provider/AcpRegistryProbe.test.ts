@@ -98,30 +98,37 @@ describe("ACP Registry probe", () => {
     });
   });
 
-  it("composes runnable terminal auth commands from the resolved spawn recipe", () => {
-    const methods = normalizeAcpRegistryAuthMethods(
-      [
+  it.each([
+    { command: undefined, expected: "FORCE_TTY=1 /opt/agents/devin --acp auth 'log in'" },
+    { command: "/opt/copilot", expected: "FORCE_TTY=1 /opt/copilot auth 'log in'" },
+  ])(
+    "composes runnable terminal auth commands from the resolved spawn recipe",
+    ({ command, expected }) => {
+      const methods = normalizeAcpRegistryAuthMethods(
+        [
+          {
+            id: "login",
+            name: "Terminal login",
+            type: "terminal",
+            ...(command === undefined ? {} : { command }),
+            args: ["auth", "log in"],
+            env: { FORCE_TTY: "1" },
+          },
+        ],
+        { command: "/opt/agents/devin", args: ["--acp"] },
+      );
+
+      expect(methods).toEqual([
         {
           id: "login",
           name: "Terminal login",
+          description: null,
           type: "terminal",
-          args: ["auth", "log in"],
-          env: { FORCE_TTY: "1" },
+          command: expected,
         },
-      ],
-      { command: "/opt/agents/devin", args: ["--acp"] },
-    );
-
-    expect(methods).toEqual([
-      {
-        id: "login",
-        name: "Terminal login",
-        description: null,
-        type: "terminal",
-        command: "FORCE_TTY=1 /opt/agents/devin --acp auth 'log in'",
-      },
-    ]);
-  });
+      ]);
+    },
+  );
 
   it("omits unsafe truncated auth commands instead of publishing broken shell", () => {
     const methods = normalizeAcpRegistryAuthMethods(

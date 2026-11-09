@@ -9,6 +9,7 @@ import {
   RunAttemptId,
   RunId,
   type ModelSelection,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   ThreadId,
@@ -1086,9 +1087,13 @@ describe("AcpRegistryAdapterV2", () => {
   // regression: #26695 cancelling a Copilot prompt kills its background agents
   it.effect("never steers Copilot by cancelling its prompt", () =>
     Effect.gen(function* () {
-      const steering = Effect.fn("steering")(function* (config: Record<string, unknown>) {
+      const steering = Effect.fn("steering")(function* (
+        config: Record<string, unknown>,
+        driverKind = ACP_REGISTRY_PROVIDER,
+      ) {
         const instanceId = ProviderInstanceId.make("acp-registry-steering");
         const adapter = yield* makeAcpRegistryAdapterV2({
+          driverKind,
           selfInvocation: yield* resolveSelfInvocation(),
           instanceId,
           settings: yield* decodeAcpRegistryAdapterSettings(config),
@@ -1110,6 +1115,13 @@ describe("AcpRegistryAdapterV2", () => {
       assert.deepEqual(yield* steering({ agentId: "github-copilot-cli" }), copilot);
       assert.deepEqual(
         yield* steering({ source: "local", commandPath: "C:\\tools\\copilot.cmd" }),
+        copilot,
+      );
+      assert.deepEqual(
+        yield* steering(
+          { source: "local", commandPath: "C:\\tools\\custom-copilot-wrapper.cmd" },
+          ProviderDriverKind.make("copilot"),
+        ),
         copilot,
       );
       assert.deepEqual(yield* steering({ agentId: "gemini" }), {

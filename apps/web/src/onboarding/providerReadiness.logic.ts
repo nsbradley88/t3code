@@ -1,6 +1,9 @@
 import {
   ClaudeSettings,
   CodexSettings,
+  isManagedDriverAllowed,
+  ProviderDriverKind,
+  type ManagedPolicySummary,
   type ExecutionEnvironmentPlatformOs,
   type ServerProvider,
   type ServerSettings,
@@ -70,6 +73,24 @@ export function selectOnboardingProvidersByDriver(
   }
 
   return providersByDriver;
+}
+
+export const ONBOARDING_AGENT_DRIVERS = ["codex", "claudeAgent", "copilot"] as const;
+
+export function selectOnboardingAgents(
+  providers: ReadonlyArray<ServerProvider> | null | undefined,
+  managedPolicy?: ManagedPolicySummary,
+) {
+  const byDriver = selectOnboardingProvidersByDriver(providers);
+  return ONBOARDING_AGENT_DRIVERS.filter((driver) =>
+    isManagedDriverAllowed(managedPolicy, ProviderDriverKind.make(driver)),
+  ).flatMap((driver) => {
+    const instances =
+      driver === "codex" ? providers?.filter((provider) => provider.driver === driver) : undefined;
+    return instances?.length
+      ? instances.map((provider) => ({ driver, provider, instanceId: provider.instanceId }))
+      : [{ driver, provider: byDriver.get(driver), instanceId: byDriver.get(driver)?.instanceId }];
+  });
 }
 
 // These need no Node/npm and install where provider maintenance recognizes native binaries.
