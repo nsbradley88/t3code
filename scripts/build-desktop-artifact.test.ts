@@ -697,9 +697,10 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         const tempDir = yield* fs.makeTempDirectoryScoped({
           prefix: "t3-windows-architecture-test-",
         });
-        const sourceDir = path.join(tempDir, "server");
+        const sourceDir = path.join(tempDir, ".hidden-stage", "server");
         const nativeFiles = [
           "node_modules/node-pty/prebuilds/win32-x64/conpty/OpenConsole.exe",
+          "node_modules/node-pty/prebuilds/win32-x64/conpty/conpty.dll",
           "node_modules/node-pty/prebuilds/win32-arm64/conpty/OpenConsole.exe",
           "node_modules/node-pty/third_party/conpty/1.0.0/win10-x64/OpenConsole.exe",
           "node_modules/node-pty/third_party/conpty/1.0.0/win10-arm64/OpenConsole.exe",
@@ -723,6 +724,11 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
               unpackedRoot,
               "node_modules/node-pty/prebuilds/win32-x64/conpty/OpenConsole.exe",
             ),
+          ),
+        );
+        assert.isTrue(
+          yield* fs.exists(
+            path.join(unpackedRoot, "node_modules/node-pty/prebuilds/win32-x64/conpty/conpty.dll"),
           ),
         );
         assert.isTrue(

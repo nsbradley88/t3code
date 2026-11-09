@@ -3039,7 +3039,8 @@ export const packWindowsServerAsar = Effect.fn("packWindowsServerAsar")(function
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   // Unpack/sign only Windows PE addons; packages also carry foreign prebuilds that Authenticode cannot sign.
-  const unpackGlobs: string[] = [...WINDOWS_SERVER_ASAR_UNPACK_GLOBS];
+  // ASAR matches absolute paths; globstars skip hidden staging ancestors such as .harness-work.
+  const unpackGlobs = WINDOWS_SERVER_ASAR_UNPACK_GLOBS.map((glob) => glob.slice(3));
   for (const entry of yield* fs.readDirectory(input.sourceDir, { recursive: true })) {
     if (!entry.endsWith(".node")) continue;
     const addonPath = path.join(input.sourceDir, entry);
@@ -3054,7 +3055,12 @@ export const packWindowsServerAsar = Effect.fn("packWindowsServerAsar")(function
         cause: new Error(`native addon path contains glob syntax: ${posixPath}`),
       });
     }
-    unpackGlobs.push(`**/${posixPath}`);
+    unpackGlobs.push(
+      addonPath
+        .split(path.sep)
+        .join("/")
+        .replace(/[*?[\]{}(),]/g, "\\$&"),
+    );
   }
   yield* Effect.tryPromise({
     try: () =>
