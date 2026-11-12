@@ -201,6 +201,7 @@ const layerService = (input: {
       Layer.succeed(HostProcess.Environment, {
         HOME: input.home,
         GROK_HOME: NodePath.join(input.home, "grok"),
+        COPILOT_HOME: NodePath.join(input.home, "copilot"),
         PI_CODING_AGENT_DIR: NodePath.join(input.home, "pi"),
         OPENCODE_DATA_DIR: NodePath.join(input.home, "opencode"),
         ANTIGRAVITY_DATA_DIR: NodePath.join(input.home, "antigravity"),
