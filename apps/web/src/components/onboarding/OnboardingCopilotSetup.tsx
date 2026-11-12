@@ -76,22 +76,24 @@ export function OnboardingCopilotSetup({
       return;
     savingRef.current = true;
     setSaving(true);
-    try {
-      const result = await update({
-        environmentId,
-        input: {
-          patch: buildProviderInstanceUpdatePatch({
-            settings: serverConfig.settings,
-            instanceId,
-            instance: next,
-          }),
-        },
+    // React Compiler does not support try/finally without catch.
+    await update({
+      environmentId,
+      input: {
+        patch: buildProviderInstanceUpdatePatch({
+          settings: serverConfig.settings,
+          instanceId,
+          instance: next,
+        }),
+      },
+    })
+      .then((result) =>
+        result._tag === "Success" ? refresh({ environmentId, input: {} }) : undefined,
+      )
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
       });
-      if (result._tag === "Success") await refresh({ environmentId, input: {} });
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
   }
 
   return (
