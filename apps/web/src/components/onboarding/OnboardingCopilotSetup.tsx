@@ -61,9 +61,7 @@ export function OnboardingCopilotSetup({
   const enabledLocked =
     configLocks.has("enabled") ||
     isManagedSettingPath(policy, `providerInstances.${instanceId}.enabled`);
-  const enabled =
-    provider?.enabled ??
-    resolveProviderInstanceEnabled({ ...instance, enabled: instance.enabled ?? false });
+  const enabled = provider?.enabled ?? resolveProviderInstanceEnabled(instance);
   const readOnly = saving || !canWriteSettings || serverConfig === null;
   const summary = getProviderSummary(provider && { ...provider, enabled });
   const state = getOnboardingProviderState(provider && { ...provider, enabled });
