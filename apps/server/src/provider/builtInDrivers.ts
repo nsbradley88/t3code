@@ -49,6 +49,7 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
 export type BuiltInUsageReadersEnv =
   | ProviderUsageReaderEnv<typeof ClaudeDriver>
   | ProviderUsageReaderEnv<typeof CodexDriver>
+  | ProviderUsageReaderEnv<typeof CopilotDriver>
   | ProviderUsageReaderEnv<typeof GrokDriver>
   | ProviderUsageReaderEnv<typeof OpenCodeDriver>
   | ProviderUsageReaderEnv<typeof AntigravityDriver>
@@ -62,6 +63,7 @@ export const BUILT_IN_USAGE_DRIVERS: ReadonlyArray<
 > = [
   ClaudeDriver,
   CodexDriver,
+  CopilotDriver,
   GrokDriver,
   PiDriver,
   OpenCodeDriver,

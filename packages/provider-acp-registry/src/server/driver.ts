@@ -16,7 +16,10 @@ import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as HttpClient from "effect/http/HttpClient";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -59,6 +62,8 @@ import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistryAuth from "./auth.ts";
 import * as AcpRegistryAuthenticationState from "./authenticationState.ts";
+import { copilotUsageReader } from "./copilotUsage.ts";
+import { readCopilotAccount, type CopilotAccount } from "./copilotUsageLimits.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 // Cache only successful authenticated probes so sign-in changes remain visible.
@@ -466,6 +471,7 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
 export type AcpRegistryDriverEnv =
   | AcpRegistryAdapterV2DriverEnv
   | Digest.Digest
+  | HttpClient.HttpClient
   | ProviderHost.ProviderHost;
 
 function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
@@ -512,6 +518,9 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const hostEnvironment = yield* HostProcess.Environment;
     const host = yield* ProviderHost.ProviderHost;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const httpClient = yield* HttpClient.HttpClient;
     const continuationIdentity = defaultProviderContinuationIdentity({
       driverKind: DRIVER_KIND,
       instanceId,
@@ -561,17 +570,38 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
         environment,
         processEnvironment,
       });
+    const readAccount =
+      DRIVER_KIND === "copilot"
+        ? readCopilotAccount(processEnvironment).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          )
+        : undefined;
+    const account = yield* Ref.make<CopilotAccount | undefined>(undefined);
     const withLiveRuntimeState = Effect.fn("AcpRegistryDriver.withLiveRuntimeState")(function* (
       input: ServerProvider,
     ) {
       if (input.auth.status === "unauthenticated") yield* confirmedAuthentication.set(false);
-      const provider =
+      const authenticated =
         input.enabled &&
         input.installed &&
         input.auth.status === "unknown" &&
         (yield* confirmedAuthentication.get)
           ? { ...input, auth: { ...input.auth, status: "authenticated" as const } }
           : input;
+      const currentAccount = yield* Ref.get(account);
+      const provider =
+        currentAccount === undefined
+          ? authenticated
+          : {
+              ...authenticated,
+              ...(currentAccount.plan && authenticated.auth.status !== "unauthenticated"
+                ? { auth: { ...authenticated.auth, label: currentAccount.plan } }
+                : {}),
+              usageLimits: currentAccount.usageLimits,
+            };
       return yield* Option.isNone(runtimeCoordinator)
         ? Effect.succeed(provider)
         : Effect.all({
@@ -594,8 +624,15 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
             }),
           );
     });
-    const checkProvider = checkAcpRegistryProviderReadiness(readinessInput).pipe(
+    const readiness = checkAcpRegistryProviderReadiness(readinessInput).pipe(
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+    );
+    const checkProvider = readiness.pipe(
+      Effect.tap((provider) =>
+        readAccount !== undefined && provider.enabled && provider.installed
+          ? readAccount.pipe(Effect.flatMap((next) => Ref.set(account, next)))
+          : Effect.void,
+      ),
       Effect.flatMap(withLiveRuntimeState),
     );
     const enrichProvider = checkAcpRegistryProviderStatus(
@@ -661,8 +698,16 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
       getSettings: snapshotSettings.getSettings,
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-      initialSnapshot: () => checkProvider,
+      initialSnapshot: () => readiness.pipe(Effect.flatMap(withLiveRuntimeState)),
       checkProvider,
+      ...(readAccount === undefined
+        ? {}
+        : {
+            checkUsageLimits: readAccount.pipe(
+              Effect.tap((next) => Ref.set(account, next)),
+              Effect.map((next) => next.usageLimits),
+            ),
+          }),
       enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
         snapshot,
         getSnapshot,
@@ -951,10 +996,13 @@ export const AcpRegistryDriver = makeAcpProviderDriver(
   false,
 );
 
-export const CopilotDriver = makeAcpProviderDriver(
-  ProviderDriverKind.make("copilot"),
-  "GitHub Copilot",
-  CopilotSettings,
-  true,
-  resolveCopilotEnvironment,
-);
+export const CopilotDriver: ProviderDriver<CopilotSettings, AcpRegistryDriverEnv, Path.Path> = {
+  ...makeAcpProviderDriver(
+    ProviderDriverKind.make("copilot"),
+    "GitHub Copilot",
+    CopilotSettings,
+    true,
+    resolveCopilotEnvironment,
+  ),
+  usage: copilotUsageReader,
+};
