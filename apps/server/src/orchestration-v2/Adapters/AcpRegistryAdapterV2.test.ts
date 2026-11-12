@@ -1124,7 +1124,7 @@ describe("AcpRegistryAdapterV2", () => {
   );
 
   // regression: #26695 cancelling a Copilot prompt kills its background agents
-  it.effect("never steers Copilot by cancelling its prompt", () =>
+  it.effect("never steers Copilot by cancelling its prompt and reports its subagents", () =>
     Effect.gen(function* () {
       const steering = Effect.fn("steering")(function* (
         config: Record<string, unknown>,
@@ -1138,17 +1138,26 @@ describe("AcpRegistryAdapterV2", () => {
           settings: yield* decodeAcpRegistryAdapterSettings(config),
           environment: {},
         }).pipe(Effect.provide(layerInjectedRuntimeCatalog));
-        const { turns } = yield* adapter.getCapabilities();
+        const { turns, subagents } = yield* adapter.getCapabilities();
         return {
           supportsInterrupt: turns.supportsInterrupt,
           supportsActiveSteering: turns.supportsActiveSteering,
           supportsSteeringByInterruptRestart: turns.supportsSteeringByInterruptRestart,
+          subagents,
         };
       });
       const copilot = {
         supportsInterrupt: true,
         supportsActiveSteering: false,
         supportsSteeringByInterruptRestart: false,
+        subagents: {
+          supportsSubagents: true,
+          exposesSubagentThreadIds: false,
+          emitsSubagentLifecycle: true,
+          canWaitForSubagents: false,
+          canCloseSubagents: false,
+          canForkSubagentThread: false,
+        },
       };
 
       assert.deepEqual(yield* steering({ agentId: "github-copilot-cli" }), copilot);
@@ -1166,6 +1175,11 @@ describe("AcpRegistryAdapterV2", () => {
       assert.deepEqual(yield* steering({ agentId: "gemini" }), {
         ...copilot,
         supportsSteeringByInterruptRestart: true,
+        subagents: {
+          ...copilot.subagents,
+          supportsSubagents: false,
+          emitsSubagentLifecycle: false,
+        },
       });
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );

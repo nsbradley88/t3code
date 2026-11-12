@@ -213,12 +213,18 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const flavor: AcpAdapterV2Flavor = {
     driver: options.driverKind ?? ACP_REGISTRY_PROVIDER,
-    // Cancelling a Copilot prompt also kills the background agents it started.
+    // Copilot ACP has no mid-turn input or per-subagent stop (1.0.109); cancelling a prompt,
+    // which a second session/prompt also does, kills the background agents it started.
     capabilities: isCopilot
       ? {
           ...AcpProviderCapabilitiesV2,
           turns: { ...AcpProviderCapabilitiesV2.turns, supportsSteeringByInterruptRestart: false },
           planning: { ...AcpProviderCapabilitiesV2.planning, emitsProposedPlan: true },
+          subagents: {
+            ...AcpProviderCapabilitiesV2.subagents,
+            supportsSubagents: true,
+            emitsSubagentLifecycle: true,
+          },
         }
       : AcpProviderCapabilitiesV2,
     customModels: readCustomModelEntries(options.settings.customModels).map((entry) => entry.slug),
