@@ -33,6 +33,8 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { makeCopilotSdkAdapterV2, CopilotSdkSpawnError } from "./copilotSdk/adapter.ts";
+import { copilotSdkTransportDisabled, withCopilotSdkTransport } from "./copilotSdk/transport.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import {
@@ -354,16 +356,20 @@ export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>
         const selfInvocation = yield* resolveSelfInvocation();
         const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
         const makeNativeLogger = yield* makeAcpNativeLoggerFactory();
-        return yield* makeAcpRegistryAdapterV2({
+        const settings = { ...input.config, enabled: input.enabled };
+        const environment = configureEnvironment(
+          input.config,
+          yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        );
+        const continuationRequests =
+          yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const acp = yield* makeAcpRegistryAdapterV2({
           driverKind,
           instanceId: input.instanceId,
-          settings: { ...input.config, enabled: input.enabled },
-          environment: configureEnvironment(
-            input.config,
-            yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
-          ),
+          settings,
+          environment,
           selfInvocation,
-          continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
+          continuationRequests,
           nativeLogging: (threadId) =>
             makeNativeLogger({
               nativeEventLogger: providerEventLoggers.native,
@@ -371,6 +377,29 @@ export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>
               threadId,
             }),
         });
+        if (driverKind !== "copilot" || copilotSdkTransportDisabled(environment)) return acp;
+        const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+        const sdk = yield* makeCopilotSdkAdapterV2({
+          instanceId: input.instanceId,
+          continuationRequests,
+          resolveSpawn: (cwd) =>
+            catalog.resolve(settings, cwd, environment).pipe(
+              Effect.map((resolved) => ({
+                command: resolved.spawn.command,
+                args: resolved.spawn.args,
+                env: { ...environment, ...resolved.spawn.env },
+                cwd,
+              })),
+              Effect.mapError(
+                (cause) =>
+                  new CopilotSdkSpawnError({
+                    detail: "Cannot resolve the Copilot executable",
+                    cause,
+                  }),
+              ),
+            ),
+        });
+        return withCopilotSdkTransport(sdk, acp);
       },
       (effect, input) =>
         effect.pipe(
