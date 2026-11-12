@@ -1473,10 +1473,10 @@ export const providerInstanceConfigEnabledFlag = (config: unknown): boolean | un
   return typeof enabled === "boolean" ? enabled : undefined;
 };
 
-// Must match each driver's enabled decoding default.
+// Must match each driver's enabled decoding default; client-runtime providerClients.test.ts checks it.
 const DEFAULT_DISABLED_PROVIDER_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set(
-  ["cursor", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"].map((driver) =>
-    ProviderDriverKind.make(driver),
+  ["cursor", "copilot", "grok", "fx", "kiro", "muse", "pi", "opencode", "antigravity"].map(
+    (driver) => ProviderDriverKind.make(driver),
   ),
 );
 

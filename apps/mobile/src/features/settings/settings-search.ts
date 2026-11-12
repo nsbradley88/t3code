@@ -75,6 +75,8 @@ const SETTINGS_SEARCH_TERMS = {
     "provider accounts",
     "codex",
     "claude",
+    "copilot",
+    "github",
     "cursor",
     "opencode",
     "sign in",

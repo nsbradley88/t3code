@@ -1642,7 +1642,7 @@ describe("OrchestratorMcpService provider resolution", () => {
       },
     ];
 
-    const capabilitiesWith = (search?: string) =>
+    const capabilitiesWith = (search?: string, providers = catalog) =>
       Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         return yield* service.capabilities(scope, search === undefined ? {} : { search });
@@ -1668,8 +1668,8 @@ describe("OrchestratorMcpService provider resolution", () => {
                     [opencodeInstanceId]: { hiddenModels: ["oc/m02"], modelOrder: ["oc/m12"] },
                   },
                 }),
-                providerRegistryLayer(catalog),
-                adapterRegistryLayer([codexInstanceId, opencodeInstanceId]),
+                providerRegistryLayer(providers),
+                adapterRegistryLayer(providers.map((provider) => provider.instanceId)),
                 Layer.mock(ProjectService.ProjectService)({}),
                 Layer.mock(SecretRequests.SecretRequests)({}),
                 Layer.mock(RemoteDelegation.RemoteDelegation)({}),
@@ -1712,6 +1712,22 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           ]);
         }),
+    );
+
+    it.effect("lists all of Copilot's current models", () =>
+      Effect.gen(function* () {
+        const slugs = Array.from({ length: 12 }, (_, index) => `copilot-m${index + 1}`);
+        const copilot: ServerProvider = {
+          ...providerSnapshot({
+            instanceId: ProviderInstanceId.make("copilot"),
+            driver: ProviderDriverKind.make("copilot"),
+          }),
+          models: slugs.map((slug) => model(slug)),
+        };
+        assert.deepEqual(listing(yield* capabilitiesWith(undefined, [copilot])), [
+          { id: copilot.instanceId, models: slugs, omitted: 0 },
+        ]);
+      }),
     );
 
     it.effect("search matches every word and caps each provider's matches", () =>
