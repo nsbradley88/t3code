@@ -118,6 +118,7 @@ describe("acpRegistrySnapshotReadiness", () => {
     });
     expect(snapshot).toMatchObject({
       driver: "copilot",
+      supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
       installed: true,
       setup: { canAuthenticate: true },
       auth: { status: "unauthenticated", label: "Sign in with GitHub" },

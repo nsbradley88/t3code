@@ -10,6 +10,7 @@ import {
   RunId,
   type ModelSelection,
   ProviderDriverKind,
+  type RuntimeMode,
   ProviderInstanceId,
   ProviderSessionId,
   ThreadId,
@@ -477,6 +478,8 @@ describe("AcpRegistryAdapterV2", () => {
       readonly storedModePick?: string;
       readonly turnModels?: ReadonlyArray<string>;
       readonly rejectedModel?: string;
+      readonly agentId?: string;
+      readonly maxRuntimeMode?: RuntimeMode;
     }) {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       // Scope release gives the replay agent at most a second to exit, so the status
@@ -523,7 +526,7 @@ describe("AcpRegistryAdapterV2", () => {
         selfInvocation: yield* resolveSelfInvocation(),
         instanceId,
         settings: yield* decodeAcpRegistryAdapterSettings({
-          agentId: "fixture-agent",
+          agentId: input.agentId ?? "fixture-agent",
           authMethodId: "test",
           customModels: input.customModels ?? [],
         }),
@@ -557,6 +560,7 @@ describe("AcpRegistryAdapterV2", () => {
         runtimeMode: "approval-required",
         interactionMode: "default",
         cwd: replayDir,
+        ...(input.maxRuntimeMode === undefined ? {} : { maxRuntimeMode: input.maxRuntimeMode }),
       });
       const stored: ModelSelection = {
         instanceId,
@@ -661,6 +665,41 @@ describe("AcpRegistryAdapterV2", () => {
         ],
         storedModePick: "auto",
       }).pipe(Effect.provide(layerTest), Effect.scoped),
+    );
+
+    it.effect.each([
+      { pick: "autopilot", applied: false },
+      { pick: "plan", applied: true },
+    ] as const)(
+      "applies a Copilot $pick pick under a policy ceiling only when within it",
+      ({ pick, applied }) => {
+        const mode = (name: string) =>
+          `https://agentclientprotocol.com/protocol/session-modes#${name}`;
+        const copilotModeOption = (current: string) => ({
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          type: "select",
+          currentValue: mode(current),
+          options: ["agent", "plan", "autopilot"].map((name) => ({ value: mode(name), name })),
+        });
+        return openWithStoredPicks({
+          agentId: "github-copilot-cli",
+          maxRuntimeMode: "auto-accept-edits",
+          setup: { configOptions: [copilotModeOption("agent")] },
+          pickFrames: applied
+            ? [
+                outbound("session/set_config_option", {
+                  sessionId: "agent-session",
+                  configId: "mode",
+                  value: mode(pick),
+                }),
+                answer("session/set_config_option", { configOptions: [copilotModeOption(pick)] }),
+              ]
+            : [],
+          storedModePick: mode(pick),
+        }).pipe(Effect.provide(layerTest), Effect.scoped);
+      },
     );
 
     const modelOption = (id: string, currentValue: string, grouped = false) => ({
@@ -2756,5 +2795,179 @@ describe("AcpRegistryAdapterV2", () => {
       assert.equal(yield* runTurn(2), "completed");
       assert.equal(spawned, restarts ? 2 : 1);
     }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect(
+    "turns Copilot's plan-mode plan file into the proposed plan and compacts natively",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const replayDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-copilot-plan-" });
+        const mode = (name: string) =>
+          `https://agentclientprotocol.com/protocol/session-modes#${name}`;
+        const modeOption = (current: string) => ({
+          type: "select",
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          currentValue: mode(current),
+          options: ["agent", "plan", "autopilot"].map((name) => ({ value: mode(name), name })),
+        });
+        const request = (method: string, params: unknown = "<any>") => ({
+          type: "expect_outbound",
+          frame: { kind: "request", method, params },
+        });
+        const respond = (method: string, result: unknown) => ({
+          type: "emit_inbound",
+          frame: { kind: "response", method, result },
+        });
+        const update = (sessionUpdate: Record<string, unknown>) => ({
+          type: "emit_inbound",
+          frame: {
+            kind: "notification",
+            method: "session/update",
+            params: { sessionId: "copilot-session", update: sessionUpdate },
+          },
+        });
+        // Copilot 1.0.109 writes plan.md with `create`, then patches it with `edit`.
+        const planPath = "<workspace>/.copilot/session-state/copilot-session/plan.md";
+        const planWrite = (toolCallId: string, rawInput: Record<string, unknown>) => [
+          update({
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "Editing plan.md",
+            kind: "edit",
+            status: "pending",
+            rawInput: { path: planPath, ...rawInput },
+            locations: [{ path: planPath }],
+          }),
+          update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed" }),
+        ];
+        const transcript = yield* decodeAcpReplayTranscript(
+          {
+            provider: ACP_REGISTRY_PROVIDER,
+            protocol: "acp.ndjson-jsonrpc",
+            version: "1",
+            scenario: "copilot-plan",
+            entries: [
+              request("initialize"),
+              respond("initialize", {
+                protocolVersion: 1,
+                agentCapabilities: { loadSession: true },
+              }),
+              request("session/new"),
+              respond("session/new", {
+                sessionId: "copilot-session",
+                modes: {
+                  currentModeId: mode("agent"),
+                  availableModes: ["agent", "plan", "autopilot"].map((name) => ({
+                    id: mode(name),
+                    name,
+                  })),
+                },
+                configOptions: [modeOption("agent")],
+              }),
+              request("session/set_config_option", {
+                sessionId: "copilot-session",
+                configId: "mode",
+                value: mode("plan"),
+              }),
+              respond("session/set_config_option", { configOptions: [modeOption("plan")] }),
+              request("session/prompt"),
+              ...planWrite("plan-create", { file_text: "# Plan\n\n- Draft\n" }),
+              ...planWrite("plan-edit", { old_str: "- Draft", new_str: "- Add hello.txt" }),
+              update({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Plan ready." },
+              }),
+              respond("session/prompt", { stopReason: "end_turn" }),
+              request("session/prompt", {
+                sessionId: "copilot-session",
+                prompt: [{ type: "text", text: "/compact" }],
+              }),
+              update({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Compacted conversation history." },
+              }),
+              respond("session/prompt", { stopReason: "end_turn" }),
+            ] as never,
+          },
+          ACP_REGISTRY_PROVIDER,
+        );
+        const statusPath = path.join(replayDir, "status.json");
+        const instanceId = ProviderInstanceId.make("copilot-plan");
+        const adapter = yield* makeAcpRegistryAdapterV2({
+          driverKind: ProviderDriverKind.make("copilot"),
+          selfInvocation: yield* resolveSelfInvocation(),
+          instanceId,
+          settings: yield* decodeAcpRegistryAdapterSettings({ agentId: "github-copilot-cli" }),
+          environment: {},
+          makeRuntime: makeAcpReplayRuntime({
+            transcript,
+            statusPath,
+            scriptPath: yield* path.fromFileUrl(
+              new URL("../../../scripts/acp-replay-agent.ts", import.meta.url),
+            ),
+            childProcessSpawner,
+            fileSystem,
+          }),
+        }).pipe(Effect.provide(layerInjectedRuntimeCatalog));
+        assert.isTrue((yield* adapter.getCapabilities()).planning.emitsProposedPlan);
+        const threadId = ThreadId.make("thread-copilot-plan");
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+          cwd: replayDir,
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("session-copilot-plan"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const finalPlan = "# Plan\n\n- Add hello.txt";
+        const planDir = path.join(replayDir, ".copilot", "session-state", "copilot-session");
+        yield* fileSystem.makeDirectory(planDir, { recursive: true });
+        yield* fileSystem.writeFileString(path.join(planDir, "plan.md"), `${finalPlan}\n`);
+        const turnEvents = <A, E>(start: Effect.Effect<A, E>) =>
+          start.pipe(
+            Effect.andThen(
+              runtime.events.pipe(
+                Stream.takeUntil((event) => event.type === "turn.terminal"),
+                Stream.runCollect,
+              ),
+            ),
+          );
+        const turnInput = (ordinal: number) =>
+          makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal });
+
+        const planTurn = yield* turnEvents(runtime.startTurn(turnInput(1)));
+        assert.deepEqual(
+          planTurn.flatMap((event) =>
+            event.type !== "plan.updated"
+              ? []
+              : [event.plan.kind === "proposed_plan" ? event.plan.markdown : event.plan.kind],
+          ),
+          [finalPlan],
+        );
+
+        assert.isDefined(runtime.compactThread);
+        const compactTurn = yield* turnEvents(runtime.compactThread!(turnInput(2)));
+        assert.isTrue(
+          compactTurn.some(
+            (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+          ),
+        );
+        yield* makeAcpReplayCompletenessAssertion(fileSystem, statusPath, transcript);
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 });

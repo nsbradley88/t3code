@@ -15,6 +15,7 @@ import {
   isCopilotLostSessionError,
   makeCopilotSubagentRouting,
 } from "./copilotAcp.ts";
+import { copilotProposedPlanFilePath, copilotRuntimeModeForSessionMode } from "./copilotModes.ts";
 import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
 import { readCustomModelEntries } from "@t3tools/shared/model";
 import { AcpRegistrySettings } from "../settings.ts";
@@ -217,6 +218,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       ? {
           ...AcpProviderCapabilitiesV2,
           turns: { ...AcpProviderCapabilitiesV2.turns, supportsSteeringByInterruptRestart: false },
+          planning: { ...AcpProviderCapabilitiesV2.planning, emitsProposedPlan: true },
         }
       : AcpProviderCapabilitiesV2,
     customModels: readCustomModelEntries(options.settings.customModels).map((entry) => entry.slug),
@@ -259,6 +261,14 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
           extractSubagentUpdate: extractCopilotSubagentUpdate,
           restartRuntimeAfterPromptError: isCopilotLostSessionError,
         }),
+    ...(isCopilot
+      ? {
+          // Copilot runs a bare `/compact` prompt as its own compaction command.
+          supportsCompaction: true,
+          runtimeModeForSessionMode: copilotRuntimeModeForSessionMode,
+          proposedPlanFilePath: copilotProposedPlanFilePath,
+        }
+      : {}),
     makeRuntime: options.makeRuntime ?? makeAcpRegistryRuntime(runtimeOptions, catalog),
     ...(runtimeCoordinator === undefined
       ? {}
