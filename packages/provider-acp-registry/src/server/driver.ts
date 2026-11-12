@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { AcpRegistrySettings, CopilotSettings } from "../settings.ts";
 import { resolveCopilotEnvironment } from "./copilotHost.ts";
+import { COPILOT_SUPPORTED_RUNTIME_MODES } from "./copilotModes.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Clock from "effect/Clock";
@@ -234,6 +235,9 @@ function baseSnapshot(
   return {
     instanceId: input.instanceId,
     driver: input.driverKind ?? DRIVER_KIND,
+    ...(input.driverKind === "copilot"
+      ? { supportedRuntimeModes: [...COPILOT_SUPPORTED_RUNTIME_MODES] }
+      : {}),
     ...(input.displayName ? { displayName: input.displayName } : {}),
     ...(input.accentColor ? { accentColor: input.accentColor } : {}),
     ...(iconUrl ? { iconUrl } : {}),
