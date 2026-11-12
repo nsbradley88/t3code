@@ -4,6 +4,7 @@ import {
   resolveOfficialAcpRegistryIconUrl,
   TextGenerationError,
   type AcpRegistryOperationError,
+  type ProviderOptionDescriptor,
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
@@ -16,7 +17,10 @@ import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as HttpClient from "effect/http/HttpClient";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -24,6 +28,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
+import { causeErrorTag } from "@t3tools/shared/observability";
 import { makeAcpRegistryAdapterDriver, type AcpRegistryAdapterV2DriverEnv } from "./adapter.ts";
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
@@ -36,7 +42,14 @@ import {
   type ProviderInstance,
 } from "@t3tools/provider-core/server/driver";
 import { providerModelsFromSettings } from "@t3tools/provider-core/server/snapshotProbe";
-import { makeManualOnlyProviderMaintenanceCapabilities } from "@t3tools/provider-core/server/maintenanceResolver";
+import {
+  enrichProviderSnapshotWithVersionAdvisory,
+  makeCachedProviderMaintenanceResolution,
+  makeManualOnlyProviderMaintenanceCapabilities,
+  resolveProviderMaintenanceCapabilitiesEffect,
+} from "@t3tools/provider-core/server/maintenanceResolver";
+import { COPILOT_MAINTENANCE, probeCopilotVersion } from "./copilotMaintenance.ts";
+import { makeCopilotTextGeneration } from "./copilotTextGeneration.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
@@ -61,6 +74,7 @@ import * as AcpRegistryAuth from "./auth.ts";
 import * as AcpRegistryAuthenticationState from "./authenticationState.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
+const COPILOT_DRIVER_KIND = ProviderDriverKind.make("copilot");
 // Cache only successful authenticated probes so sign-in changes remain visible.
 const PROBE_SUCCESS_TTL_MS = 15 * 60 * 1_000;
 const EMPTY_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
@@ -83,11 +97,27 @@ const makeUnsupportedTextGeneration = (displayName: string): ProviderTextGenerat
   };
 };
 
+type ModelCapabilitiesById = ReadonlyMap<string, ServerProviderModel["capabilities"]>;
+
+function capabilitiesByModel(
+  descriptors: ReadonlyMap<string, ReadonlyArray<ProviderOptionDescriptor>> | undefined,
+): ModelCapabilitiesById | undefined {
+  return descriptors === undefined
+    ? undefined
+    : new Map(
+        Array.from(descriptors, ([model, optionDescriptors]) => [
+          model,
+          createModelCapabilities({ optionDescriptors }),
+        ]),
+      );
+}
+
 function modelsFromDiscovery(
   discovery:
     | Pick<AcpRegistryLiveConfiguration, "models" | "currentModelId" | "configOptions">
     | undefined,
   customModels: ReadonlyArray<string>,
+  modelCapabilities?: ModelCapabilitiesById,
 ): ReadonlyArray<ServerProviderModel> {
   const discovered = discovery?.models ?? [];
   const capabilities =
@@ -110,7 +140,7 @@ function modelsFromDiscovery(
           name: model.name,
           isCustom: false,
           ...(model.id === discovery?.currentModelId ? { isDefault: true } : {}),
-          capabilities,
+          capabilities: modelCapabilities?.get(model.id) ?? capabilities,
         }));
   return providerModelsFromSettings(builtInModels, customModels, capabilities);
 }
@@ -206,7 +236,7 @@ function baseSnapshot(
     ...(input.accentColor ? { accentColor: input.accentColor } : {}),
     ...(iconUrl ? { iconUrl } : {}),
     continuation: { groupKey: input.continuationKey },
-    supportsTextGeneration: false,
+    supportsTextGeneration: input.driverKind === COPILOT_DRIVER_KIND,
     enabled: input.settings.enabled,
     installed: input.installed,
     version: input.version,
@@ -225,7 +255,11 @@ function baseSnapshot(
             : input.settings.agentId.length > 0),
     },
     ...(input.message ? { message: input.message } : {}),
-    models: modelsFromDiscovery(input.probe?.probe, input.settings.customModels),
+    models: modelsFromDiscovery(
+      input.probe?.probe,
+      input.settings.customModels,
+      capabilitiesByModel(input.probe?.modelOptionDescriptors),
+    ),
     ...(input.probe === undefined
       ? {}
       : {
@@ -256,6 +290,10 @@ export function applyAcpRegistryLiveConfiguration(
   provider: ServerProvider,
   configuration: AcpRegistryLiveConfiguration,
   customModels: ReadonlyArray<string>,
+  options?: {
+    /** Live options describe only the session's current model; others keep probed options. */
+    readonly perModelOptions?: boolean;
+  },
 ): ServerProvider {
   const { message: _staleProbeMessage, ...snapshot } = provider;
   // session/load may omit models (Kimi returns `{}`); keep the probed list
@@ -273,13 +311,22 @@ export function applyAcpRegistryLiveConfiguration(
           })),
           currentModelId: probedModels.find((model) => model.isDefault)?.slug ?? null,
         };
+  const liveModelId = configuration.currentModelId;
+  const keptCapabilities: ModelCapabilitiesById | undefined =
+    options?.perModelOptions && liveModelId !== null
+      ? new Map(
+          probedModels
+            .filter((model) => model.slug !== liveModelId)
+            .map((model) => [model.slug, model.capabilities]),
+        )
+      : undefined;
   return {
     ...snapshot,
     status: provider.enabled ? "ready" : provider.status,
     models:
       configuration.models.length === 0 && configuration.configOptions.length === 0
         ? provider.models
-        : modelsFromDiscovery(discovery, customModels),
+        : modelsFromDiscovery(discovery, customModels, keptCapabilities),
   };
 }
 
@@ -466,7 +513,11 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
 export type AcpRegistryDriverEnv =
   | AcpRegistryAdapterV2DriverEnv
   | Digest.Digest
-  | ProviderHost.ProviderHost;
+  | FileSystem.FileSystem
+  | HttpClient.HttpClient
+  | Path.Path
+  | ProviderHost.ProviderHost
+  | ProviderLatestVersions.ProviderLatestVersions;
 
 function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
   DRIVER_KIND: ProviderDriverKind,
@@ -483,9 +534,10 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
     configSchema,
     configureEnvironment,
   );
-  const maintenance = makeManualOnlyProviderMaintenanceCapabilities({
+  const isCopilot = DRIVER_KIND === COPILOT_DRIVER_KIND;
+  const manualMaintenance = makeManualOnlyProviderMaintenanceCapabilities({
     provider: DRIVER_KIND,
-    packageName: DRIVER_KIND === "copilot" ? "@github/copilot" : null,
+    packageName: null,
   });
   const create = Effect.fn("AcpRegistryDriver.create")(function* ({
     instanceId,
@@ -512,6 +564,10 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const hostEnvironment = yield* HostProcess.Environment;
     const host = yield* ProviderHost.ProviderHost;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const pathService = yield* Path.Path;
+    const httpClient = yield* HttpClient.HttpClient;
+    const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
     const continuationIdentity = defaultProviderContinuationIdentity({
       driverKind: DRIVER_KIND,
       instanceId,
@@ -553,6 +609,28 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
       settings: effectiveConfig,
       environment: processEnvironment,
     };
+    const resolveMaintenance = isCopilot
+      ? yield* makeCachedProviderMaintenanceResolution(
+          resolveProviderMaintenanceCapabilitiesEffect(COPILOT_MAINTENANCE, {
+            binaryPath: effectiveConfig.commandPath,
+            env: processEnvironment,
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, pathService),
+          ),
+        )
+      : () => Effect.succeed(manualMaintenance);
+    // Advisories are computed in the background and stamped onto later snapshots.
+    const versionAdvisoryRef = yield* Ref.make<ServerProvider["versionAdvisory"]>(undefined);
+    const withCopilotVersion = (provider: ServerProvider) =>
+      !isCopilot || !provider.installed || provider.version !== null
+        ? Effect.succeed(provider)
+        : probeCopilotVersion(effectiveConfig, host.paths.cwd, processEnvironment).pipe(
+            Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.map((version) => (version === null ? provider : { ...provider, version })),
+          );
     const confirmedAuthentication =
       yield* AcpRegistryAuthenticationState.makeAcpRegistryAuthenticationState({
         cacheDir: host.paths.providerStatusCacheDir,
@@ -562,8 +640,13 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
         processEnvironment,
       });
     const withLiveRuntimeState = Effect.fn("AcpRegistryDriver.withLiveRuntimeState")(function* (
-      input: ServerProvider,
+      snapshotInput: ServerProvider,
     ) {
+      const versionAdvisory = yield* Ref.get(versionAdvisoryRef);
+      const input =
+        versionAdvisory !== undefined && versionAdvisory.currentVersion === snapshotInput.version
+          ? { ...snapshotInput, versionAdvisory }
+          : snapshotInput;
       if (input.auth.status === "unauthenticated") yield* confirmedAuthentication.set(false);
       const provider =
         input.enabled &&
@@ -588,6 +671,7 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
                     withCommands,
                     liveConfiguration,
                     effectiveConfig.customModels,
+                    { perModelOptions: isCopilot },
                   ),
               });
               return applyAcpRegistryUrlAuthAction(withConfiguration, authAction);
@@ -596,6 +680,7 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
     });
     const checkProvider = checkAcpRegistryProviderReadiness(readinessInput).pipe(
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+      Effect.flatMap(withCopilotVersion),
       Effect.flatMap(withLiveRuntimeState),
     );
     const enrichProvider = checkAcpRegistryProviderStatus(
@@ -603,11 +688,14 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
         ...readinessInput,
         cwd: host.paths.cwd,
       },
-      probeAcpRegistryConfiguration,
+      isCopilot
+        ? (input) => probeAcpRegistryConfiguration({ ...input, probeModelOptions: true })
+        : probeAcpRegistryConfiguration,
     ).pipe(
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       Effect.provideService(SecureRandom.SecureRandom, random),
+      Effect.flatMap(withCopilotVersion),
     );
     const enrichmentCache = yield* Ref.make<{
       readonly generation: number;
@@ -657,18 +745,47 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
     const snapshot = yield* makeManagedServerProvider<
       ProviderSnapshotSettings<AcpRegistrySettings>
     >({
-      resolveMaintenance: () => Effect.succeed(maintenance),
+      resolveMaintenance,
       getSettings: snapshotSettings.getSettings,
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
       initialSnapshot: () => checkProvider,
       checkProvider,
       enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
+        settings,
         snapshot,
         getSnapshot,
         publishSnapshot,
       }) {
         if (!snapshot.installed) return Effect.void;
+        const publishVersionAdvisory = isCopilot
+          ? resolveMaintenance().pipe(
+              Effect.flatMap((capabilities) =>
+                enrichProviderSnapshotWithVersionAdvisory(snapshot, capabilities, {
+                  enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
+                }),
+              ),
+              Effect.provideService(HttpClient.HttpClient, httpClient),
+              Effect.provideService(ProviderLatestVersions.ProviderLatestVersions, latestVersions),
+              Effect.flatMap(({ versionAdvisory }) =>
+                liveSnapshotSemaphore.withPermit(
+                  Ref.set(versionAdvisoryRef, versionAdvisory).pipe(
+                    Effect.andThen(getSnapshot),
+                    Effect.flatMap((current) =>
+                      current.version === versionAdvisory?.currentVersion
+                        ? publishSnapshot({ ...current, versionAdvisory })
+                        : Effect.void,
+                    ),
+                  ),
+                ),
+              ),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("GitHub Copilot version advisory enrichment failed", {
+                  errorTag: causeErrorTag(cause),
+                }),
+              ),
+            )
+          : Effect.void;
         const publishEnrichment = (
           Option.isSome(runtimeCoordinator)
             ? runtimeCoordinator.value.runBackgroundProbe(
@@ -695,7 +812,12 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
             }),
           ),
         );
-        if (Option.isNone(runtimeCoordinator)) return publishEnrichment;
+        if (Option.isNone(runtimeCoordinator)) {
+          return Effect.all([publishEnrichment, publishVersionAdvisory], {
+            concurrency: "unbounded",
+            discard: true,
+          });
+        }
 
         const publishLiveCommands = runtimeCoordinator.value.watchAvailableCommands(
           instanceId,
@@ -723,6 +845,7 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
                       current,
                       configuration,
                       effectiveConfig.customModels,
+                      { perModelOptions: isCopilot },
                     ),
                   ),
                 ),
@@ -743,7 +866,13 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
             ),
         );
         return Effect.all(
-          [publishEnrichment, publishLiveCommands, publishLiveConfiguration, publishUrlAuthAction],
+          [
+            publishEnrichment,
+            publishLiveCommands,
+            publishLiveConfiguration,
+            publishUrlAuthAction,
+            publishVersionAdvisory,
+          ],
           {
             concurrency: "unbounded",
             discard: true,
@@ -821,6 +950,14 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
       ),
     };
 
+    const textGeneration = isCopilot
+      ? yield* makeCopilotTextGeneration(effectiveConfig, processEnvironment).pipe(
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+        )
+      : makeUnsupportedTextGeneration("ACP Registry");
+
     return {
       instanceId,
       driverKind: DRIVER_KIND,
@@ -834,9 +971,7 @@ function makeAcpProviderDriver<Config extends AcpRegistrySettings>(
         refresh: snapshot.refresh.pipe(Effect.tap(() => controller.refreshMethods ?? Effect.void)),
       },
       orchestrationAdapter,
-      textGeneration: makeUnsupportedTextGeneration(
-        DRIVER_KIND === "copilot" ? "GitHub Copilot" : "ACP Registry",
-      ),
+      textGeneration,
       acpSessionManagement: {
         listSessions: ({ cwd, cursor }) =>
           provideAcpManagementServices(
