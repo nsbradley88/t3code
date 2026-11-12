@@ -43,6 +43,10 @@ Multiple instances share the CLI login unless you isolate them using the CLI's
 own configuration. Copilot does not supply T3's app-owned text generation, such
 as commit messages and thread titles; choose another provider for those actions.
 
+Messages you send while Copilot is working wait until its turn ends, because
+interrupting Copilot also stops the background agents it started. Copilot's
+subagents cannot be stopped one at a time.
+
 ## Add an agent
 
 1. Open **Settings → Providers**.
