@@ -41,14 +41,18 @@ const COPILOT_TEXT_GENERATION_ARGS = [
   "--disable-builtin-mcps",
   "--no-ask-user",
   "--sync-session=off",
-  // An empty list exposes every tool; `view` is confined to the empty working directory.
+  // Text generation needs no tools. An empty allowlist exposes every tool, so allow only
+  // `view` and then exclude it as well: prompts carry diffs, which must not be able to steer
+  // the model into reading files (saved trusted folders can widen path access) into output.
   "--available-tools=view",
+  "--excluded-tools=view",
   "--disallow-temp-dir",
   // Deny rules outrank every allow rule, including saved approvals and --allow-all.
   "--deny-tool=shell",
   "--deny-tool=write",
   "--deny-tool=memory",
   "--deny-tool=url",
+  "--deny-tool=view",
 ] as const;
 
 const CopilotAssistantMessage = Schema.Struct({
