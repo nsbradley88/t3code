@@ -35,7 +35,7 @@ const { values } = NodeUtil.parseArgs({
     timeout: { type: "string", default: "420" },
   },
 });
-const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "child", "subagent"];
+const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "todos", "child", "subagent"];
 const selected = values.scenario === "all" ? SCENARIOS : values.scenario.split(",");
 for (const name of selected) NodeAssert.ok(SCENARIOS.includes(name), `unknown scenario ${name}`);
 const timeoutMs = Number(values.timeout) * 1000;
@@ -173,21 +173,17 @@ try {
 
   const program = Effect.gen(function* () {
     const client = yield* RpcClient.make(WsRpcGroup);
-    const run = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(effect);
+    const runtime = Effect.runPromiseWith(yield* Effect.context<never>());
+    const run = <A, E>(effect: Effect.Effect<A, E>) => runtime(effect);
     const dispatch = (command: Record<string, unknown>) =>
       run(
         client["orchestration.dispatchCommand"]({
           commandId: CommandId.make(NodeCrypto.randomUUID()),
           ...command,
-        } as never) as Effect.Effect<unknown, unknown>,
+        } as never),
       );
     const projectionOf = (threadId: ThreadId): Promise<OrchestrationV2ThreadProjection> =>
-      run(
-        client["orchestration.getThreadProjection"]({ threadId }) as Effect.Effect<
-          OrchestrationV2ThreadProjection,
-          unknown
-        >,
-      );
+      run(client["orchestration.getThreadProjection"]({ threadId }));
     const waitFor = async <A>(
       what: string,
       threadId: ThreadId,
@@ -228,7 +224,7 @@ try {
           workspaceStrategy: { type: "root" },
           initialMessage: { text, attachments: [] },
           ...extra,
-        } as never) as Effect.Effect<unknown, unknown>,
+        } as never),
       );
       return threadId;
     };
@@ -285,13 +281,13 @@ try {
         instanceId,
         instance: { driver: "copilot", enabled: true },
       },
-    } as never) as Effect.Effect<unknown, unknown>;
+    } as never);
     const copilotProvider = async () => {
       const deadline = Date.now() + 120_000;
       for (;;) {
-        const config = (await run(
-          client["server.getConfig"]({} as never) as Effect.Effect<unknown, unknown>,
-        )) as { providers: ReadonlyArray<Record<string, any>> };
+        const config = (await run(client["server.getConfig"]({} as never))) as {
+          providers: ReadonlyArray<Record<string, any>>;
+        };
         const provider = config.providers.find((candidate) => candidate.instanceId === instanceId);
         if (
           provider &&
@@ -448,8 +444,7 @@ try {
           "the shell write did not run (approval blocked it?)",
         );
         NodeAssert.equal(
-          projection.runtimeRequests.filter((request) => request.kind === "command_approval")
-            .length,
+          projection.runtimeRequests.filter((request) => request.kind === "command").length,
           0,
           "bypass still asked for approval",
         );
@@ -537,6 +532,31 @@ try {
           status: stopped.value.status,
           childThreadId: stopped.value.childThreadId,
           childPrompt: childPrompt.value.text.slice(0, 80),
+        };
+      });
+
+      await scenario("todos", async () => {
+        const threadId = await launch(
+          "Copilot todos",
+          "Track this work in your todo list: create exactly three todos titled one, two and three, then mark todo one as done. Then reply with exactly OK.",
+        );
+        await waitFor(
+          "a finished run",
+          threadId,
+          (projection) =>
+            projection.runs.length > 0 &&
+            projection.runs.every((candidate) => isTerminalRun(candidate.status)),
+          240_000,
+        );
+        const projection = await projectionOf(threadId);
+        await saveProjection("todos-projection", threadId);
+        const lists = projection.plans.filter((plan) => plan.kind === "todo_list");
+        const last = lists.at(-1);
+        NodeAssert.ok(last && last.kind === "todo_list", "no todo list was published");
+        NodeAssert.ok(last.steps.length >= 3, "the todo list is missing steps");
+        return {
+          lists: lists.length,
+          steps: last.steps.map((step) => `${step.text}:${step.status}`),
         };
       });
 
