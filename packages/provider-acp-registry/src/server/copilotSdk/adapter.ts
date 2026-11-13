@@ -10,12 +10,14 @@ import {
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
+  type NodeId,
   type OrchestrationV2TurnItemStatus,
   type PlanId,
   type ProviderApprovalDecision,
   type ProviderInstanceId,
   type RuntimeMode,
   type RuntimeRequestId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
@@ -36,6 +38,11 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { providerMessageTextWithAttachmentPaths } from "@t3tools/provider-core/server/attachmentPrompt";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
+import {
+  makeSubagentChildThread,
+  makeSubagentConversationArtifacts,
+  subagentThreadTitle,
+} from "@t3tools/provider-core/server/subagentProjection";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
 import {
@@ -229,6 +236,21 @@ interface TurnItemState {
   exitCode?: number;
   agentName?: string | undefined;
   prompt?: string;
+  childThreadId?: ThreadId;
+}
+
+/** A Copilot background agent shown as a child thread of the thread that started it. */
+interface SubagentThread {
+  readonly toolCallId: string;
+  readonly nativeKey: string;
+  readonly threadId: ThreadId;
+  readonly rootNodeId: NodeId;
+  readonly parentThreadId: ThreadId;
+  readonly startedAt: DateTime.Utc;
+  nextOrdinal: number;
+  promptSeen: boolean;
+  lastResponse: string;
+  finished: boolean;
 }
 
 interface ActiveTurn {
@@ -364,6 +386,8 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       const pending = new Map<RuntimeRequestId, PendingRequest>();
       const finishedTerminals = new Set<string>();
       const subagentTasks = new Map<string, string>();
+      const subagentThreads = new Map<string, SubagentThread>();
+      const subagentByAgentId = new Map<string, string>();
       // A subagent outlives the turn that started it, so its later events publish against that turn.
       const observedSubagents = new Map<string, ActiveTurn>();
       let closed = false;
@@ -575,7 +599,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             driver: COPILOT_PROVIDER,
             providerInstanceId: options.instanceId,
             providerThreadId: base.providerThreadId,
-            childThreadId: null,
+            childThreadId: state.childThreadId ?? null,
             nativeTaskRef: nativeRef(nativeId),
             prompt: state.prompt ?? "",
             title: state.agentName ?? "Copilot agent",
@@ -595,7 +619,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             origin: "provider_native",
             driver: COPILOT_PROVIDER,
             providerInstanceId: options.instanceId,
-            childThreadId: null,
+            childThreadId: state.childThreadId ?? null,
             prompt: subagent.prompt,
             result: subagent.result,
           };
@@ -1168,6 +1192,154 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         return undefined;
       });
 
+      const emitChildRoot = Effect.fnUntraced(function* (
+        child: SubagentThread,
+        status: "running" | "completed" | "failed" | "cancelled",
+      ) {
+        const time = yield* DateTime.now;
+        yield* emit({
+          type: "node.updated",
+          driver: COPILOT_PROVIDER,
+          node: {
+            id: child.rootNodeId,
+            threadId: child.threadId,
+            runId: null,
+            parentNodeId: null,
+            rootNodeId: child.rootNodeId,
+            kind: "root_turn",
+            status,
+            countsForRun: false,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: nativeRef(child.toolCallId),
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: child.startedAt,
+            completedAt: status === "running" ? null : time,
+          },
+        });
+      });
+
+      const openChildThread = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        toolCallId: string,
+        agentId: string | undefined,
+        agentName: string | undefined,
+        prompt: string,
+      ) {
+        const existing = subagentThreads.get(toolCallId);
+        if (existing) return existing;
+        const now = yield* DateTime.now;
+        const row = baseItem(turn, toolCallId, now);
+        const nativeKey = itemIdentity(turn, toolCallId);
+        const child: SubagentThread = {
+          toolCallId,
+          nativeKey,
+          threadId: idAllocator.derive.threadFromProviderThread({
+            driver: COPILOT_PROVIDER,
+            nativeThreadId: `${turn.input.providerThread.id}:${toolCallId}`,
+          }),
+          rootNodeId: idAllocator.derive.nodeFromProviderItem({
+            driver: COPILOT_PROVIDER,
+            nativeItemId: `${nativeKey}:thread-root`,
+          }),
+          parentThreadId: turn.input.threadId,
+          startedAt: now,
+          nextOrdinal: 100,
+          promptSeen: false,
+          lastResponse: "",
+          finished: false,
+        };
+        subagentThreads.set(toolCallId, child);
+        if (agentId) subagentByAgentId.set(agentId, toolCallId);
+        yield* emit({
+          type: "app_thread.created",
+          driver: COPILOT_PROVIDER,
+          appThread: makeSubagentChildThread({
+            parentThread: turn.input.appThread,
+            childThreadId: child.threadId,
+            parentNodeId: row.nodeId,
+            activeProviderThreadId: null,
+            providerInstanceId: options.instanceId,
+            modelSelection: turn.input.modelSelection,
+            title: subagentThreadTitle({
+              parentTitle: turn.input.appThread.title,
+              title: agentName ?? null,
+              prompt,
+              ordinal: subagentThreads.size,
+            }),
+            now,
+            createdBy: "agent",
+            creationSource: "provider",
+          }),
+        });
+        return child;
+      });
+
+      const emitChildMessage = Effect.fnUntraced(function* (
+        child: SubagentThread,
+        key: string,
+        role: "user" | "assistant",
+        text: string,
+      ) {
+        const nativeItemId = `${child.nativeKey}:${key}`;
+        const artifacts = makeSubagentConversationArtifacts({
+          messageId: idAllocator.derive.messageFromProviderItem({
+            driver: COPILOT_PROVIDER,
+            nativeItemId,
+          }),
+          ...(role === "user" ? { senderThreadId: child.parentThreadId } : {}),
+          turnItemId: idAllocator.derive.turnItemFromProviderItem({
+            driver: COPILOT_PROVIDER,
+            nativeItemId,
+          }),
+          threadId: child.threadId,
+          rootNodeId: child.rootNodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: nativeRef(nativeItemId),
+          role,
+          text,
+          ordinal: child.nextOrdinal++,
+          now: yield* DateTime.now,
+        });
+        yield* emit({
+          type: "message.updated",
+          driver: COPILOT_PROVIDER,
+          message: artifacts.message,
+        });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: COPILOT_PROVIDER,
+          turnItem: artifacts.turnItem,
+        });
+      });
+
+      /** The agent's own prompt and replies fill its child thread, even after the parent turn ends. */
+      const handleChildEvent = Effect.fnUntraced(function* (
+        child: SubagentThread,
+        event: SdkEvent,
+      ) {
+        const data = event.data ?? {};
+        const text = (asString(data.content) ?? "").trim();
+        if (event.type === "user.message" && !child.promptSeen && text) {
+          child.promptSeen = true;
+          yield* emitChildMessage(child, "prompt", "user", text);
+          const owner = observedSubagents.get(child.toolCallId);
+          const state = owner?.items.get(child.toolCallId);
+          if (owner && state)
+            yield* touch(owner, child.toolCallId, { ...state, prompt: text }, true);
+        } else if (event.type === "assistant.message" && text) {
+          child.lastResponse = text;
+          yield* emitChildMessage(
+            child,
+            asString(data.messageId) ?? `reply-${child.nextOrdinal}`,
+            "assistant",
+            text,
+          );
+        }
+      });
+
       const handleTurnEvent = Effect.fnUntraced(function* (turn: ActiveTurn, event: SdkEvent) {
         const data = event.data ?? {};
         const isSub = event.agentId !== undefined || data.parentToolCallId !== undefined;
@@ -1271,6 +1443,15 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             if (!toolCallId) return;
             turn.hasSubagents = true;
             observedSubagents.set(toolCallId, turn);
+            const agentName = asString(data.agentDisplayName) ?? asString(data.agentName);
+            const prompt = asString(data.agentDescription) ?? "";
+            const child = yield* openChildThread(
+              turn,
+              toolCallId,
+              event.agentId,
+              agentName,
+              prompt,
+            );
             yield* touch(
               turn,
               toolCallId,
@@ -1278,11 +1459,13 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                 kind: "subagent",
                 text: "",
                 status: "running",
-                agentName: asString(data.agentDisplayName) ?? asString(data.agentName),
-                prompt: asString(data.agentDescription) ?? "",
+                agentName,
+                prompt,
+                childThreadId: child.threadId,
               },
               true,
             );
+            yield* emitChildRoot(child, "running");
             yield* refreshTasks();
             return;
           }
@@ -1292,16 +1475,22 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             const state = toolCallId ? turn.items.get(toolCallId) : undefined;
             if (!toolCallId || !state) return;
             observedSubagents.delete(toolCallId);
+            const child = subagentThreads.get(toolCallId);
+            const status =
+              event.type === "subagent.failed"
+                ? ("failed" as const)
+                : data.cancelled === true
+                  ? ("cancelled" as const)
+                  : ("completed" as const);
             yield* touch(turn, toolCallId, {
               ...state,
-              status:
-                event.type === "subagent.failed"
-                  ? "failed"
-                  : data.cancelled === true
-                    ? "cancelled"
-                    : "completed",
-              text: asString(data.error) ?? state.text,
+              status,
+              text: asString(data.error) ?? (child?.lastResponse || state.text),
             });
+            if (child) {
+              child.finished = true;
+              yield* emitChildRoot(child, status);
+            }
             yield* refreshTasks();
             return;
           }
@@ -1411,6 +1600,19 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           default:
             break;
         }
+        const childKey =
+          asString(data.parentToolCallId) ??
+          (event.agentId === undefined ? undefined : subagentByAgentId.get(event.agentId));
+        const child = childKey === undefined ? undefined : subagentThreads.get(childKey);
+        if (
+          child &&
+          event.type !== "subagent.started" &&
+          event.type !== "subagent.completed" &&
+          event.type !== "subagent.failed"
+        ) {
+          yield* handleChildEvent(child, event);
+          return;
+        }
         if (event.type === "subagent.completed" || event.type === "subagent.failed") {
           const owner = observedSubagents.get(asString(data.toolCallId) ?? "");
           if (owner && owner !== active) return yield* handleTurnEvent(owner, event);
@@ -1456,6 +1658,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           if (state) yield* publishItem(owner, toolCallId, state, "failed");
         }
         observedSubagents.clear();
+        for (const child of subagentThreads.values()) {
+          if (child.finished) continue;
+          child.finished = true;
+          yield* emitChildRoot(child, "failed");
+        }
         yield* cancelPending();
         yield* Queue.fail(events, protocolError(detail));
       });

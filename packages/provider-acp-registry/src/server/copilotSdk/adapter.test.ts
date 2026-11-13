@@ -1095,5 +1095,107 @@ describe("CopilotSdkAdapterV2 UI integration", () => {
   );
 });
 
+describe("CopilotSdkAdapterV2 subagent threads", () => {
+  const started = {
+    toolCallId: "tool-sub",
+    agentName: "general-purpose",
+    agentDisplayName: "echo-agent",
+    agentDescription: "Run echo",
+  };
+
+  it.live("shows a background agent as a child thread that outlives the parent turn", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      yield* startTurn(harness, fake);
+      yield* fake.emit("subagent.started", started, { agentId: "agent-1" });
+      const created = yield* harness.takeEvent("app_thread.created");
+      assert.strictEqual(created.appThread.lineage.relationshipToParent, "subagent");
+      assert.strictEqual(created.appThread.lineage.parentThreadId, THREAD_ID);
+      assert.strictEqual(created.appThread.forkedFrom?.type, "node");
+      assert.strictEqual(created.appThread.title, "echo-agent");
+      const row = yield* harness.takeEvent("subagent.updated");
+      assert.strictEqual(row.subagent.childThreadId, created.appThread.id);
+      assert.strictEqual(row.subagent.status, "running");
+      const root = yield* harness.takeEvent(
+        "node.updated",
+        (event) => event.node.kind === "root_turn",
+      );
+      assert.strictEqual(root.node.threadId, created.appThread.id);
+      assert.strictEqual(root.node.status, "running");
+
+      // The main loop ends while the agent keeps working; its events still reach the child thread.
+      yield* fake.emit("assistant.idle");
+      yield* harness.takeEvent("turn.terminal");
+      yield* fake.emit(
+        "user.message",
+        { content: "Run `echo hi`, then reply DONE" },
+        { agentId: "agent-1" },
+      );
+      const prompt = yield* harness.takeEvent(
+        "message.updated",
+        (event) => event.message.threadId === created.appThread.id,
+      );
+      assert.strictEqual(prompt.message.role, "user");
+      assert.strictEqual(prompt.message.text, "Run `echo hi`, then reply DONE");
+      const reprompted = yield* harness.takeEvent(
+        "subagent.updated",
+        (event) => event.subagent.prompt === "Run `echo hi`, then reply DONE",
+      );
+      assert.strictEqual(reprompted.subagent.childThreadId, created.appThread.id);
+
+      yield* fake.emit(
+        "assistant.message",
+        { messageId: "reply-1", content: "DONE", parentToolCallId: "tool-sub" },
+        { agentId: "agent-1" },
+      );
+      const reply = yield* harness.takeEvent(
+        "message.updated",
+        (event) =>
+          event.message.role === "assistant" && event.message.threadId === created.appThread.id,
+      );
+      assert.strictEqual(reply.message.text, "DONE");
+
+      yield* fake.emit("subagent.completed", started, { agentId: "agent-1" });
+      const done = yield* harness.takeEvent(
+        "subagent.updated",
+        (event) => event.subagent.status === "completed",
+      );
+      assert.strictEqual(done.subagent.result, "DONE");
+      const closed = yield* harness.takeEvent(
+        "node.updated",
+        (event) => event.node.kind === "root_turn" && event.node.status === "completed",
+      );
+      assert.strictEqual(closed.node.threadId, created.appThread.id);
+      // The agent's replies never leak into the parent thread.
+      assert.strictEqual(
+        harness.allEvents.some(
+          (event) =>
+            event.type === "message.updated" &&
+            event.message.threadId === THREAD_ID &&
+            event.message.text === "DONE",
+        ),
+        false,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("ends an open child thread as failed when the connection drops", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      yield* startTurn(harness, fake);
+      yield* fake.emit("subagent.started", started, { agentId: "agent-1" });
+      yield* harness.takeEvent("node.updated", (event) => event.node.kind === "root_turn");
+      yield* fake.exit();
+      const failed = yield* harness.takeEvent(
+        "node.updated",
+        (event) => event.node.kind === "root_turn" && event.node.status === "failed",
+      );
+      assert.strictEqual(failed.node.runId, null);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+});
+
 // Silence unused-import analysis for the driver constant used by stubs.
 void COPILOT;

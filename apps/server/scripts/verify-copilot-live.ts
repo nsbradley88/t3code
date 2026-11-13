@@ -35,7 +35,7 @@ const { values } = NodeUtil.parseArgs({
     timeout: { type: "string", default: "420" },
   },
 });
-const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "subagent", "attachment"];
+const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "child", "subagent"];
 const selected = values.scenario === "all" ? SCENARIOS : values.scenario.split(",");
 for (const name of selected) NodeAssert.ok(SCENARIOS.includes(name), `unknown scenario ${name}`);
 const timeoutMs = Number(values.timeout) * 1000;
@@ -307,6 +307,7 @@ try {
     };
 
     yield* Effect.promise(async () => {
+      await copilotProvider();
       await scenario("catalog", async () => {
         const provider = await copilotProvider();
         NodeFS.writeFileSync(
@@ -336,13 +337,11 @@ try {
         return summary;
       });
 
-      let steerThread: ThreadId | undefined;
       await scenario("steer", async () => {
         const threadId = await launch(
           "Copilot steer",
           "Run these 6 shell commands ONE AT A TIME, each as a separate tool call, never in parallel: `sleep 8; echo a`, then b, c, d, e, f (sleep 8 before each echo). Do nothing else.",
         );
-        steerThread = threadId;
         await waitFor(
           "a running tool",
           threadId,
@@ -509,6 +508,13 @@ try {
         const projection = await projectionOf(threadId);
         const target = projection.runs.at(-1);
         NodeAssert.ok(target, "no run");
+        const childId = projection.subagents.find(
+          (agent) => agent.id === started.value.id,
+        )?.childThreadId;
+        NodeAssert.ok(childId, "the subagent has no child thread");
+        const childPrompt = await waitFor("the child's prompt", ThreadId.make(childId), (child) =>
+          child.messages.find((message) => message.role === "user"),
+        );
         const sentAt = Date.now();
         await dispatch({
           type: "subagent.stop",
@@ -530,12 +536,47 @@ try {
           stopMs: stopped.at - sentAt,
           status: stopped.value.status,
           childThreadId: stopped.value.childThreadId,
+          childPrompt: childPrompt.value.text.slice(0, 80),
         };
       });
 
-      await scenario("attachment", async () => {
-        NodeAssert.ok(steerThread, "needs the steer thread");
-        return "covered by adapter tests";
+      await scenario("child", async () => {
+        const threadId = await launch(
+          "Copilot child",
+          "Use your task tool to start ONE general-purpose agent whose job is: run `echo hello-from-agent` in the shell, then reply with the single word DONE. Wait for it to finish, then tell me what it said.",
+        );
+        const done = await waitFor(
+          "a completed subagent",
+          threadId,
+          (projection) => projection.subagents.find((agent) => agent.status === "completed"),
+          240_000,
+        );
+        const childId = done.value.childThreadId;
+        NodeAssert.ok(childId, "the subagent has no child thread");
+        const child = await projectionOf(ThreadId.make(childId));
+        await waitFor("the parent run to settle", threadId, (projection) =>
+          projection.runs.every((candidate) => isTerminalRun(candidate.status)),
+        );
+        NodeFS.writeFileSync(
+          NodePath.join(evidence, "child-projection.json"),
+          JSON.stringify(child, null, 2),
+        );
+        const roles = child.messages.map(
+          (message) => `${message.role}: ${message.text.slice(0, 60)}`,
+        );
+        NodeAssert.ok(
+          child.messages.some((message) => message.role === "user"),
+          "no prompt in the child thread",
+        );
+        NodeAssert.ok(
+          child.messages.some(
+            (message) => message.role === "assistant" && /DONE/.test(message.text),
+          ),
+          "the child thread has no reply",
+        );
+        NodeAssert.ok(/DONE/.test(done.value.result ?? ""), "the subagent result lost the reply");
+        NodeAssert.equal(child.thread.lineage.relationshipToParent, "subagent");
+        return { childThreadId: childId, roles, result: done.value.result };
       });
     });
   }).pipe(Effect.scoped, Effect.provide(layerProtocol), Effect.timeout(timeoutMs));

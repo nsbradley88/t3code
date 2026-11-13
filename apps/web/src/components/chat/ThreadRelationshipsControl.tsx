@@ -32,6 +32,7 @@ import {
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
   NodeId,
+  supportsNativeSubagentStop,
   type EnvironmentId,
   type OrchestrationV2DelegatedFrom,
   type OrchestrationV2RemoteTaskChild,
@@ -718,7 +719,7 @@ export function ThreadRelationshipsPanel(props: {
       agent &&
       (agent.origin === "app_owned" ||
         (agent.origin === "provider_native" &&
-          agent.driver === "claudeAgent" &&
+          supportsNativeSubagentStop(agent.driver) &&
           agent.runId != null &&
           agent.nativeTaskRef?.strength === "strong" &&
           agent.nativeTaskRef.nativeId !== null &&
