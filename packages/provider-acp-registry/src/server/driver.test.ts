@@ -118,7 +118,9 @@ describe("acpRegistrySnapshotReadiness", () => {
     });
     expect(snapshot).toMatchObject({
       driver: "copilot",
+      supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
       installed: true,
+      supportsTextGeneration: true,
       setup: { canAuthenticate: true },
       auth: { status: "unauthenticated", label: "Sign in with GitHub" },
     });
@@ -287,6 +289,81 @@ describe("acpRegistrySnapshotReadiness", () => {
         capabilities: { optionDescriptors: [{ id: "effort", currentValue: "high" }] },
       },
     ]);
+  });
+
+  it("keeps Copilot reasoning options per model when live configuration arrives", () => {
+    const effort = (values: ReadonlyArray<string>, currentValue = "medium") => ({
+      id: "reasoning_effort",
+      label: "Reasoning Effort",
+      type: "select" as const,
+      options: values.map((id) => ({ id, label: id })),
+      currentValue,
+      role: "reasoning" as const,
+    });
+    const provider = buildCheckedAcpRegistrySnapshot({
+      ...identity,
+      driverKind: ProviderDriverKind.make("copilot"),
+      settings: { ...CopilotDriver.defaultConfig(), enabled: true },
+      checkedAt: "2026-08-13T10:00:00.000Z",
+      inspection: { status: "ready", agentId: "copilot", version: null, distribution: "local" },
+      probe: {
+        probe: {
+          instanceId: identity.instanceId,
+          ready: true,
+          icon: null,
+          authMethods: [],
+          models: [
+            { id: "claude-sonnet-5.5", name: "Claude Sonnet 5.5", description: null },
+            { id: "gpt-6-luna", name: "GPT-6 Luna", description: null },
+            { id: "auto", name: "Auto", description: null },
+            { id: "unreached", name: "Unreached", description: null },
+          ],
+          currentModelId: "claude-sonnet-5.5",
+          configOptions: [effort(["low", "medium", "high"])],
+          sessionManagement: noSessionManagement,
+        },
+        slashCommands: [],
+        skills: [],
+        // From session/set_config_option replies captured from Copilot CLI 1.0.109.
+        modelOptionDescriptors: new Map([
+          ["claude-sonnet-5.5", [effort(["low", "medium", "high"])]],
+          ["gpt-6-luna", [effort(["none", "low", "medium", "high"])]],
+          ["auto", []],
+        ]),
+      },
+    });
+    const effortChoices = (snapshot: typeof provider) =>
+      Object.fromEntries(
+        snapshot.models.map((model) => [
+          model.slug,
+          model.capabilities?.optionDescriptors?.flatMap((descriptor) =>
+            descriptor.type === "select" ? descriptor.options.map((option) => option.id) : [],
+          ),
+        ]),
+      );
+    expect(effortChoices(provider)).toEqual({
+      "claude-sonnet-5.5": ["low", "medium", "high"],
+      "gpt-6-luna": ["none", "low", "medium", "high"],
+      auto: [],
+      unreached: ["low", "medium", "high"],
+    });
+
+    const live = {
+      models: [],
+      currentModelId: "gpt-6-luna",
+      configOptions: [effort(["none", "low", "medium", "high"], "high")],
+    };
+    const updated = applyAcpRegistryLiveConfiguration(provider, live, [], {
+      perModelOptions: true,
+    });
+    expect(effortChoices(updated)).toEqual(effortChoices(provider));
+    expect(updated.models.find((model) => model.slug === "gpt-6-luna")).toMatchObject({
+      capabilities: { optionDescriptors: [{ id: "reasoning_effort", currentValue: "high" }] },
+    });
+    // Agents without per-model options still apply live options to every model.
+    expect(effortChoices(applyAcpRegistryLiveConfiguration(provider, live, []))).toMatchObject({
+      auto: ["none", "low", "medium", "high"],
+    });
   });
 
   it("projects discovery without claiming authentication when no login methods are advertised", () => {

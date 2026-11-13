@@ -884,6 +884,10 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
 });
 export type OrchestrationV2RemoteTaskChild = typeof OrchestrationV2RemoteTaskChild.Type;
 
+/** These drivers' adapters implement `stopSubagent`, so one native subagent stops on its own. */
+export const supportsNativeSubagentStop = (driver: string): boolean =>
+  driver === "claudeAgent" || driver === "copilot";
+
 export const OrchestrationV2Subagent = Schema.Struct({
   id: NodeId,
   threadId: ThreadId,

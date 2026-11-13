@@ -61,9 +61,7 @@ export function OnboardingCopilotSetup({
   const enabledLocked =
     configLocks.has("enabled") ||
     isManagedSettingPath(policy, `providerInstances.${instanceId}.enabled`);
-  const enabled =
-    provider?.enabled ??
-    resolveProviderInstanceEnabled({ ...instance, enabled: instance.enabled ?? false });
+  const enabled = provider?.enabled ?? resolveProviderInstanceEnabled(instance);
   const readOnly = saving || !canWriteSettings || serverConfig === null;
   const summary = getProviderSummary(provider && { ...provider, enabled });
   const state = getOnboardingProviderState(provider && { ...provider, enabled });
@@ -78,22 +76,24 @@ export function OnboardingCopilotSetup({
       return;
     savingRef.current = true;
     setSaving(true);
-    try {
-      const result = await update({
-        environmentId,
-        input: {
-          patch: buildProviderInstanceUpdatePatch({
-            settings: serverConfig.settings,
-            instanceId,
-            instance: next,
-          }),
-        },
+    // React Compiler does not support try/finally without catch.
+    await update({
+      environmentId,
+      input: {
+        patch: buildProviderInstanceUpdatePatch({
+          settings: serverConfig.settings,
+          instanceId,
+          instance: next,
+        }),
+      },
+    })
+      .then((result) =>
+        result._tag === "Success" ? refresh({ environmentId, input: {} }) : undefined,
+      )
+      .finally(() => {
+        savingRef.current = false;
+        setSaving(false);
       });
-      if (result._tag === "Success") await refresh({ environmentId, input: {} });
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
   }
 
   return (

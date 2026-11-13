@@ -489,6 +489,8 @@ export interface AcpAdapterV2Flavor {
   readonly isProvisionalSubagentTool?: (toolCall: AcpToolCallState) => boolean;
   readonly normalizeToolCall?: (toolCall: AcpToolCallState) => AcpToolCallState;
   readonly extractProposedPlanMarkdown?: (toolCall: AcpToolCallState) => string | undefined;
+  /** For agents that keep a plan-mode turn's plan in a file: the plan file a tool call wrote. */
+  readonly proposedPlanFilePath?: (toolCall: AcpToolCallState) => string | undefined;
   readonly extractBackgroundTaskId?: (toolCall: AcpToolCallState) => string | undefined;
   /** Distinguishes commands from monitors when lifecycle notifications omit their kind. */
   readonly isBackgroundCommandTool?: (toolCall: AcpToolCallState) => boolean;
@@ -7639,6 +7641,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* terminalizeOpenRunOwnedItems(context, {
               terminalizeSubagents: directStopQuarantine,
             });
+          }
+          if (
+            settledStatus === "completed" &&
+            context.input.runtimePolicy.interactionMode === "plan" &&
+            flavor.proposedPlanFilePath !== undefined
+          ) {
+            let planPath: string | undefined;
+            for (const tool of context.tools.values()) {
+              if (tool.status !== "completed") continue;
+              planPath = flavor.proposedPlanFilePath(tool) ?? planPath;
+            }
+            if (planPath !== undefined) {
+              yield* captureProposedPlan({
+                planMarkdown: yield* fileSystem
+                  .readFileString(planPath)
+                  .pipe(Effect.orElseSucceed(() => "")),
+              });
+            }
           }
           yield* closeTextStreams(context);
           if (settledStatus !== "failed") {

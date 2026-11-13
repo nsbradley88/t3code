@@ -15,6 +15,7 @@ import {
   isCopilotLostSessionError,
   makeCopilotSubagentRouting,
 } from "./copilotAcp.ts";
+import { copilotProposedPlanFilePath, copilotRuntimeModeForSessionMode } from "./copilotModes.ts";
 import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
 import { readCustomModelEntries } from "@t3tools/shared/model";
 import { AcpRegistrySettings } from "../settings.ts";
@@ -32,6 +33,12 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import {
+  makeCopilotSdkAdapterV2,
+  CopilotSdkSpawnError,
+  type CopilotSdkCommandInfo,
+} from "./copilotSdk/adapter.ts";
+import { copilotSdkTransportDisabled, withCopilotSdkTransport } from "./copilotSdk/transport.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import {
@@ -212,11 +219,18 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const flavor: AcpAdapterV2Flavor = {
     driver: options.driverKind ?? ACP_REGISTRY_PROVIDER,
-    // Cancelling a Copilot prompt also kills the background agents it started.
+    // Copilot ACP has no mid-turn input or per-subagent stop (1.0.109); cancelling a prompt,
+    // which a second session/prompt also does, kills the background agents it started.
     capabilities: isCopilot
       ? {
           ...AcpProviderCapabilitiesV2,
           turns: { ...AcpProviderCapabilitiesV2.turns, supportsSteeringByInterruptRestart: false },
+          planning: { ...AcpProviderCapabilitiesV2.planning, emitsProposedPlan: true },
+          subagents: {
+            ...AcpProviderCapabilitiesV2.subagents,
+            supportsSubagents: true,
+            emitsSubagentLifecycle: true,
+          },
         }
       : AcpProviderCapabilitiesV2,
     customModels: readCustomModelEntries(options.settings.customModels).map((entry) => entry.slug),
@@ -259,6 +273,14 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
           extractSubagentUpdate: extractCopilotSubagentUpdate,
           restartRuntimeAfterPromptError: isCopilotLostSessionError,
         }),
+    ...(isCopilot
+      ? {
+          // Copilot runs a bare `/compact` prompt as its own compaction command.
+          supportsCompaction: true,
+          runtimeModeForSessionMode: copilotRuntimeModeForSessionMode,
+          proposedPlanFilePath: copilotProposedPlanFilePath,
+        }
+      : {}),
     makeRuntime: options.makeRuntime ?? makeAcpRegistryRuntime(runtimeOptions, catalog),
     ...(runtimeCoordinator === undefined
       ? {}
@@ -338,16 +360,20 @@ export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>
         const selfInvocation = yield* resolveSelfInvocation();
         const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
         const makeNativeLogger = yield* makeAcpNativeLoggerFactory();
-        return yield* makeAcpRegistryAdapterV2({
+        const settings = { ...input.config, enabled: input.enabled };
+        const environment = configureEnvironment(
+          input.config,
+          yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        );
+        const continuationRequests =
+          yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const acp = yield* makeAcpRegistryAdapterV2({
           driverKind,
           instanceId: input.instanceId,
-          settings: { ...input.config, enabled: input.enabled },
-          environment: configureEnvironment(
-            input.config,
-            yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
-          ),
+          settings,
+          environment,
           selfInvocation,
-          continuationRequests: yield* ProviderContinuationRequests.ProviderContinuationRequests,
+          continuationRequests,
           nativeLogging: (threadId) =>
             makeNativeLogger({
               nativeEventLogger: providerEventLoggers.native,
@@ -355,6 +381,65 @@ export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>
               threadId,
             }),
         });
+        if (driverKind !== "copilot" || copilotSdkTransportDisabled(environment)) return acp;
+        const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+        const coordinator = Option.getOrUndefined(
+          yield* Effect.serviceOption(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator),
+        );
+        const sdk = yield* makeCopilotSdkAdapterV2({
+          instanceId: input.instanceId,
+          continuationRequests,
+          // The probe already lists Copilot's commands and skills; a session adds project-level
+          // ones, so merge instead of replacing what the probe found.
+          ...(coordinator === undefined
+            ? {}
+            : {
+                publishCommands: Effect.fn("CopilotSdk.publishCommands")(function* (
+                  commands: ReadonlyArray<CopilotSdkCommandInfo>,
+                ) {
+                  const existing = Option.getOrUndefined(
+                    yield* coordinator.getAvailableCommands(input.instanceId),
+                  );
+                  const merged = new Map(
+                    (existing?.slashCommands ?? []).map((command) => [
+                      command.name.toLowerCase(),
+                      command,
+                    ]),
+                  );
+                  for (const command of normalizeAcpRegistryCommands(
+                    commands.map((command) => ({
+                      name: command.name,
+                      description: command.description,
+                      ...(command.hint
+                        ? { input: { type: "text" as const, hint: command.hint } }
+                        : {}),
+                    })),
+                  ).slashCommands)
+                    merged.set(command.name.toLowerCase(), command);
+                  yield* coordinator.publishAvailableCommands(input.instanceId, {
+                    slashCommands: [...merged.values()],
+                    skills: existing?.skills ?? [],
+                  });
+                }),
+              }),
+          resolveSpawn: (cwd) =>
+            catalog.resolve(settings, cwd, environment).pipe(
+              Effect.map((resolved) => ({
+                command: resolved.spawn.command,
+                args: resolved.spawn.args,
+                env: { ...environment, ...resolved.spawn.env },
+                cwd,
+              })),
+              Effect.mapError(
+                (cause) =>
+                  new CopilotSdkSpawnError({
+                    detail: "Cannot resolve the Copilot executable",
+                    cause,
+                  }),
+              ),
+            ),
+        });
+        return withCopilotSdkTransport(sdk, acp);
       },
       (effect, input) =>
         effect.pipe(

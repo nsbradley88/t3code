@@ -15,6 +15,7 @@ import {
   OrchestrationV2ThreadHistoryPage,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
+  supportsNativeSubagentStop,
 } from "./orchestrationV2.ts";
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
@@ -637,5 +638,13 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("supportsNativeSubagentStop", () => {
+  it("covers the drivers whose adapters stop a single native subagent", () => {
+    expect(supportsNativeSubagentStop("claudeAgent")).toBe(true);
+    expect(supportsNativeSubagentStop("copilot")).toBe(true);
+    expect(supportsNativeSubagentStop("codex")).toBe(false);
   });
 });

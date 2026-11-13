@@ -7,6 +7,7 @@ import {
   type AcpRegistryProbeModel,
   type AcpRegistryUrlAuthAction,
   type ProviderInstanceId,
+  type ProviderOptionDescriptor,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
@@ -47,6 +48,7 @@ const MAX_COMMAND_LINE_LENGTH = 2_048;
 const PROBE_TIMEOUT_SECONDS = 60;
 const PROBE_TIMEOUT = `${PROBE_TIMEOUT_SECONDS} seconds`;
 const COMMAND_ADVERTISEMENT_GRACE = "500 millis";
+const MODEL_OPTIONS_PROBE_TIMEOUT = "10 seconds";
 
 const boundedText = (value: string, maximumLength: number): string =>
   value.trim().slice(0, maximumLength);
@@ -314,6 +316,8 @@ export interface AcpRegistryConfigurationProbeInput {
   readonly settings: AcpRegistrySettings;
   readonly cwd: string;
   readonly environment: NodeJS.ProcessEnv;
+  /** Switch the disposable session through each advertised model to read its own options. */
+  readonly probeModelOptions?: boolean;
 }
 
 type AcpRegistryManagementInput = AcpRegistryConfigurationProbeInput;
@@ -322,7 +326,48 @@ export interface AcpRegistryConfigurationProbeResult {
   readonly probe: AcpRegistryProbeResult;
   readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
+  /** Option descriptors by model id, for agents whose options differ per model. */
+  readonly modelOptionDescriptors?: ReadonlyMap<string, ReadonlyArray<ProviderOptionDescriptor>>;
 }
+
+/**
+ * Copilot answers session/set_config_option with the options of the model it switched to, and
+ * reasoning effort differs by model. Models not reached in time keep the session's options.
+ */
+export const probeModelOptionDescriptors = Effect.fn(
+  "AcpRegistryProbe.probeModelOptionDescriptors",
+)(function* (
+  runtime: AcpSessionRuntime.AcpSessionRuntime["Service"],
+  sessionSetupResult: AcpSessionRuntime.AcpSessionRuntimeStartResult["sessionSetupResult"],
+) {
+  const configOptions = sessionSetupResult.configOptions ?? [];
+  const modelOption = findModelConfigOption(configOptions);
+  if (modelOption === undefined) return undefined;
+  const modeState = parseSessionModeState(sessionSetupResult);
+  const descriptors = new Map<string, ReadonlyArray<ProviderOptionDescriptor>>([
+    [modelOption.currentValue, acpProviderOptionDescriptors({ configOptions, modeState })],
+  ]);
+  const models = [
+    ...new Set(flattenSelectChoices(modelOption.options).map((choice) => choice.value)),
+  ].slice(0, MAX_MODELS);
+  yield* Effect.forEach(
+    models.filter((model) => !descriptors.has(model)),
+    (model) =>
+      runtime.setConfigOption(modelOption.id, model).pipe(
+        Effect.tap((response) =>
+          Effect.sync(() =>
+            descriptors.set(
+              model,
+              acpProviderOptionDescriptors({ configOptions: response.configOptions, modeState }),
+            ),
+          ),
+        ),
+        Effect.ignore,
+      ),
+    { discard: true },
+  ).pipe(Effect.timeoutOption(MODEL_OPTIONS_PROBE_TIMEOUT));
+  return descriptors;
+});
 
 export type AcpRegistryConfigurationProbe<Requirements = never> = (
   input: AcpRegistryConfigurationProbeInput,
@@ -437,7 +482,11 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       yield* Deferred.await(commandsAdvertised).pipe(
         Effect.timeoutOption(COMMAND_ADVERTISEMENT_GRACE),
       );
-      return { resolved, started, commands: yield* Ref.get(commandsRef) };
+      const commands = yield* Ref.get(commandsRef);
+      const modelOptionDescriptors = input.probeModelOptions
+        ? yield* probeModelOptionDescriptors(runtime, started.sessionSetupResult)
+        : undefined;
+      return { resolved, started, commands, modelOptionDescriptors };
     }).pipe(
       Effect.scoped,
       Effect.timeoutOrElse({
@@ -466,6 +515,9 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       ),
       slashCommands: result.commands.slashCommands,
       skills: result.commands.skills,
+      ...(result.modelOptionDescriptors === undefined
+        ? {}
+        : { modelOptionDescriptors: result.modelOptionDescriptors }),
     };
   },
 );

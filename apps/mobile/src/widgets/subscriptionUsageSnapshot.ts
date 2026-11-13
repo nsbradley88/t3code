@@ -20,6 +20,8 @@ export interface SubscriptionUsageSnapshot {
   }>;
 }
 
+const WIDGET_PROVIDERS = { codex: "Codex", claudeAgent: "Claude", copilot: "Copilot" } as const;
+
 // Snapshots expire after 15 minutes; suspended refresh requires a separate authenticated transport.
 const SNAPSHOT_MAX_AGE = 15 * 60_000;
 export const WIDGET_REFRESH_INTERVAL = 5 * 60_000;
@@ -52,18 +54,18 @@ function subscriptionUsageProps(
 ): SubscriptionUsageSnapshot {
   const pools = collectLimitPools(accounts, now);
   const checked = accounts
-    .filter((account) => account.driver === "codex" || account.driver === "claudeAgent")
+    .filter((account) => Object.hasOwn(WIDGET_PROVIDERS, account.driver))
     .map((account) => Date.parse(account.limits.checkedAt));
   return {
     checkedAt: checked.length > 0 && checked.every(Number.isFinite) ? Math.min(...checked) : 0,
-    providers: (["codex", "claudeAgent"] as const)
+    providers: (Object.keys(WIDGET_PROVIDERS) as Array<keyof typeof WIDGET_PROVIDERS>)
       .filter(
         (driver) =>
           configuredDrivers.has(driver) || accounts.some((account) => account.driver === driver),
       )
       .map((driver) => {
         const pool = pools.find((candidate) => candidate.driver === driver);
-        const name = driver === "codex" ? "Codex" : "Claude";
+        const name = WIDGET_PROVIDERS[driver];
         if (!pool)
           return {
             name,
