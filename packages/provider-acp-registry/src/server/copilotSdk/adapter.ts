@@ -11,12 +11,12 @@ import {
   type OrchestrationV2Subagent,
   type OrchestrationV2TurnItem,
   type OrchestrationV2TurnItemStatus,
+  type PlanId,
   type ProviderApprovalDecision,
   type ProviderInstanceId,
   type RuntimeMode,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
-import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -49,6 +49,8 @@ import {
   copilotPermissionKind,
   copilotPermissionPrompt,
   copilotPermissionModeForRuntimeMode,
+  copilotPermissionModeForSelection,
+  copilotPickerChoices,
   copilotToolPresentation,
   type CopilotPermissionRequest,
   type CopilotPermissionMode,
@@ -129,7 +131,7 @@ export const CopilotSdkCapabilitiesV2 = {
   },
   planning: {
     emitsPlanUpdated: false,
-    emitsTodoList: false,
+    emitsTodoList: true,
     emitsProposedPlan: true,
     supportsStructuredQuestions: true,
     planDeltasHaveItemIds: false,
@@ -167,8 +169,19 @@ export const CopilotSdkCapabilitiesV2 = {
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
+/** One slash command as Copilot's session lists it. */
+export interface CopilotSdkCommandInfo {
+  readonly name: string;
+  readonly description: string;
+  readonly hint?: string;
+}
+
 export interface CopilotSdkAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
+  /** Receives the session's slash commands when it opens and whenever Copilot changes them. */
+  readonly publishCommands?: (
+    commands: ReadonlyArray<CopilotSdkCommandInfo>,
+  ) => Effect.Effect<void>;
   readonly resolveSpawn: (
     cwd: string,
   ) => Effect.Effect<Omit<CopilotSdkSpawnInput, "platform">, CopilotSdkSpawnError>;
@@ -242,6 +255,7 @@ interface ActiveTurn {
   compact: boolean;
   hasSubagents: boolean;
   steers: number;
+  todoPlanId: PlanId | undefined;
 }
 
 interface PendingRequest {
@@ -363,6 +377,9 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
       );
       let appliedPermission: CopilotPermissionMode | undefined;
       let appliedSessionMode: CopilotSessionMode | undefined;
+      let appliedEffort: string | undefined;
+      // Names (and aliases) Copilot accepts as slash commands in this session.
+      const knownCommands = new Set<string>();
       let runtimeMode: RuntimeMode = input.runtimePolicy.runtimeMode;
       let pendingTasks: ReadonlyArray<{
         readonly taskId: string;
@@ -433,6 +450,43 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         yield* request("session.mode.set", { mode });
         appliedSessionMode = mode;
       });
+
+      const rememberCommands = (raw: unknown): ReadonlyArray<CopilotSdkCommandInfo> => {
+        knownCommands.clear();
+        const infos: Array<CopilotSdkCommandInfo> = [];
+        for (const entry of Array.isArray(raw) ? raw : []) {
+          const command = asRecord(entry);
+          const name = asString(command.name)?.replace(/^\//, "").trim();
+          if (!name) continue;
+          knownCommands.add(name.toLowerCase());
+          for (const alias of Array.isArray(command.aliases) ? command.aliases : [])
+            if (typeof alias === "string")
+              knownCommands.add(alias.replace(/^\//, "").toLowerCase());
+          const hint = asString(asRecord(command.input).hint)?.trim();
+          infos.push({
+            name,
+            description: asString(command.description) ?? "",
+            ...(hint ? { hint } : {}),
+          });
+        }
+        return infos;
+      };
+      const publishCommandList = Effect.fnUntraced(function* (raw: unknown) {
+        const infos = rememberCommands(raw);
+        if (options.publishCommands) yield* options.publishCommands(infos);
+      });
+      const loadCommands = Effect.fnUntraced(function* () {
+        const result = yield* request("session.commands.list");
+        yield* publishCommandList(asRecord(result).commands);
+      });
+      /** `/name args` when Copilot lists `name` as a command; paths like `/usr/bin` stay prompts. */
+      const slashCommandOf = (text: string) => {
+        const match = /^\s*\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(text);
+        const name = match?.[1];
+        return name && knownCommands.has(name.toLowerCase())
+          ? { name, input: (match?.[2] ?? "").trim() }
+          : undefined;
+      };
 
       const itemIdentity = (turn: ActiveTurn, nativeId: string) =>
         `${options.instanceId}:${turn.input.providerThread.id}:${turn.nativeId}:${nativeId}`;
@@ -984,6 +1038,136 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         }
       });
 
+      const publishTodos = Effect.fnUntraced(function* (turn: ActiveTurn) {
+        const result = yield* request("session.plan.readSqlTodos").pipe(Effect.option);
+        if (result._tag === "None") return;
+        const raw = asRecord(result.value).rows;
+        const steps = (Array.isArray(raw) ? raw : []).flatMap((entry, index) => {
+          const row = asRecord(entry);
+          const text = (asString(row.title) ?? asString(row.description) ?? "").trim();
+          if (!text) return [];
+          const state = asString(row.status);
+          return [
+            {
+              id: (asString(row.id) ?? "").trim() || `todo-${index + 1}`,
+              text,
+              status:
+                state === "done" || state === "completed"
+                  ? ("completed" as const)
+                  : state === "in_progress"
+                    ? ("running" as const)
+                    : ("pending" as const),
+            },
+          ];
+        });
+        if (steps.length === 0) return;
+        const time = yield* DateTime.now;
+        const base = baseItem(turn, "todos", time);
+        turn.todoPlanId ??= yield* idAllocator.allocate
+          .plan({
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            driver: COPILOT_PROVIDER,
+          })
+          .pipe(Effect.orDie);
+        const planId = turn.todoPlanId;
+        const complete = steps.every((step) => step.status === "completed");
+        const status = complete ? ("completed" as const) : ("running" as const);
+        yield* emit({
+          type: "node.updated",
+          driver: COPILOT_PROVIDER,
+          node: {
+            id: base.nodeId,
+            threadId: base.threadId,
+            runId: base.runId,
+            parentNodeId: turn.input.rootNodeId,
+            rootNodeId: turn.input.rootNodeId,
+            kind: "todo_list",
+            status,
+            countsForRun: false,
+            providerThreadId: base.providerThreadId,
+            providerTurnId: base.providerTurnId,
+            nativeItemRef: base.nativeItemRef,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: base.startedAt,
+            completedAt: complete ? time : null,
+          },
+        });
+        yield* emit({
+          type: "plan.updated",
+          driver: COPILOT_PROVIDER,
+          plan: {
+            id: planId,
+            threadId: turn.input.threadId,
+            runId: turn.input.runId,
+            nodeId: base.nodeId,
+            kind: "todo_list",
+            status: complete ? "completed" : "active",
+            steps,
+          },
+        });
+        yield* emit({
+          type: "turn_item.updated",
+          driver: COPILOT_PROVIDER,
+          turnItem: {
+            ...base,
+            status,
+            title: null,
+            completedAt: complete ? time : null,
+            type: "todo_list",
+            planId,
+            steps,
+          },
+        });
+      });
+
+      /**
+       * Runs a Copilot slash command. Commands that only print or change settings finish the T3
+       * turn here; commands that hand Copilot a prompt return it so the turn runs as normal.
+       */
+      const runSlashCommand = Effect.fnUntraced(function* (
+        turn: ActiveTurn,
+        name: string,
+        commandInput: string,
+      ) {
+        const result = asRecord(
+          yield* request("session.commands.invoke", { name, input: commandInput }, 60_000),
+        );
+        const kind = asString(result.kind);
+        const mode = asString(result.mode) as CopilotSessionMode | undefined;
+        const say = (text: string) =>
+          eventPermit.withPermits(1)(
+            Effect.gen(function* () {
+              if (text.trim())
+                yield* touch(turn, `slash:${turn.nativeId}`, {
+                  kind: "assistant",
+                  text,
+                  status: "completed",
+                });
+              yield* finish(turn, "completed");
+            }),
+          );
+        if (kind === "agent-prompt") {
+          if (mode) yield* applySessionMode(mode);
+          return {
+            prompt: asString(result.prompt) ?? "",
+            displayPrompt: asString(result.displayPrompt) ?? `/${name}`,
+            mode,
+            effect: asString(result.reservationToken) === undefined ? undefined : result,
+          };
+        }
+        if (kind === "completed" && mode) yield* applySessionMode(mode);
+        yield* say(
+          kind === "text"
+            ? (asString(result.text) ?? "")
+            : kind === "completed"
+              ? (asString(result.message) ?? "")
+              : `\`/${name}\` needs Copilot's interactive terminal, which T3 Code cannot show here.`,
+        );
+        return undefined;
+      });
+
       const handleTurnEvent = Effect.fnUntraced(function* (turn: ActiveTurn, event: SdkEvent) {
         const data = event.data ?? {};
         const isSub = event.agentId !== undefined || data.parentToolCallId !== undefined;
@@ -1208,6 +1392,14 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             if (pending.size === 0 && active) yield* updateSession("running");
             return;
           }
+          case "commands.changed": {
+            yield* publishCommandList(data.commands).pipe(Effect.ignore);
+            return;
+          }
+          case "session.todos_changed": {
+            if (active) yield* publishTodos(active).pipe(Effect.ignore);
+            return;
+          }
           case "session.mode_changed": {
             appliedSessionMode =
               (asString(data.newMode) as CopilotSessionMode | undefined) ?? appliedSessionMode;
@@ -1363,7 +1555,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         >,
       ) {
         const mcpSession = yield* mcpSessions.read(args.threadId);
-        const effort = getModelSelectionStringOptionValue(args.modelSelection, "reasoningEffort");
+        const effort = copilotPickerChoices(args.modelSelection).reasoningEffort;
         const modelId = copilotModelId(args.modelSelection);
         return {
           ...(modelId ? { model: modelId } : {}),
@@ -1408,10 +1600,15 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         if (returned && returned !== nativeSessionId)
           return yield* protocolError("Copilot returned a different session identity");
         runtimeMode = args.runtimePolicy.runtimeMode;
-        desiredPermission = copilotPermissionModeForRuntimeMode(runtimeMode);
+        desiredPermission = copilotPermissionModeForSelection(
+          runtimeMode,
+          copilotPickerChoices(args.modelSelection),
+        );
         appliedPermission = undefined;
         appliedSessionMode = undefined;
+        appliedEffort = undefined;
         yield* applyPermissionMode();
+        yield* loadCommands().pipe(Effect.ignore);
         const createdAt = yield* DateTime.now;
         thread = existing
           ? {
@@ -1470,6 +1667,23 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         return text;
       });
 
+      /** Images travel as native file attachments so vision models see them, not just a path. */
+      const sdkAttachments = (message: ProviderAdapter.ProviderAdapterV2TurnMessage) =>
+        message.attachments.flatMap((attachment) => {
+          if (attachment.type !== "image") return [];
+          const path = providerHost.resolveAttachmentPath(attachment);
+          return path === null
+            ? []
+            : [
+                {
+                  type: "file" as const,
+                  path,
+                  displayName: attachment.name,
+                  mimeType: attachment.mimeType,
+                },
+              ];
+        });
+
       const start = Effect.fnUntraced(function* (
         turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         compact = false,
@@ -1487,23 +1701,32 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           turnInput.message.createdBy === "agent" &&
           turnInput.message.creationSource === "provider";
         // Mode changes land before the turn so a bypass selection holds from its first tool call.
+        const picks = copilotPickerChoices(turnInput.modelSelection);
         runtimeMode = turnInput.runtimePolicy.runtimeMode;
-        desiredPermission = copilotPermissionModeForRuntimeMode(runtimeMode);
+        desiredPermission = copilotPermissionModeForSelection(runtimeMode, picks);
         yield* applyPermissionMode();
-        yield* applySessionMode(
-          turnInput.runtimePolicy.interactionMode === "plan" ? "plan" : "interactive",
-        );
+        // T3's plan mode wins; otherwise the picker's Agent/Plan/Autopilot choice applies.
+        const agentMode: CopilotSessionMode =
+          turnInput.runtimePolicy.interactionMode === "plan"
+            ? "plan"
+            : (picks.sessionMode ?? "interactive");
+        yield* applySessionMode(agentMode);
         const targetModel = copilotModelId(turnInput.modelSelection);
-        if (!continuation && targetModel && session.model !== targetModel) {
-          const effort = getModelSelectionStringOptionValue(
-            turnInput.modelSelection,
-            "reasoningEffort",
-          );
-          yield* request("session.model.switchTo", {
-            modelId: targetModel,
-            ...(effort ? { reasoningEffort: effort } : {}),
-          });
-          session = { ...session, model: targetModel };
+        if (!continuation) {
+          if (targetModel && session.model !== targetModel) {
+            yield* request("session.model.switchTo", {
+              modelId: targetModel,
+              ...(picks.reasoningEffort ? { reasoningEffort: picks.reasoningEffort } : {}),
+            });
+            session = { ...session, model: targetModel };
+            appliedEffort = picks.reasoningEffort;
+          } else if (picks.reasoningEffort && picks.reasoningEffort !== appliedEffort) {
+            // A level the current model rejects leaves the model on its own effort.
+            yield* request("session.model.setReasoningEffort", {
+              reasoningEffort: picks.reasoningEffort,
+            }).pipe(Effect.ignore);
+            appliedEffort = picks.reasoningEffort;
+          }
         }
         const text = compact || continuation ? "" : yield* promptText(turnInput.message);
         const held = wake;
@@ -1548,6 +1771,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
           compact,
           hasSubagents: false,
           steers: 0,
+          todoPlanId: undefined,
         };
         yield* Effect.gen(function* () {
           thread = turnInput.providerThread;
@@ -1600,15 +1824,35 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             );
             return;
           }
+          let prompt = text;
+          let displayPrompt = turnInput.message.text || text;
+          let sendMode: CopilotSessionMode = agentMode;
+          let commandEffect: Record<string, unknown> | undefined;
+          const command = continuation ? undefined : slashCommandOf(turnInput.message.text);
+          if (command) {
+            const expanded = yield* runSlashCommand(turn, command.name, command.input);
+            if (expanded === undefined) return;
+            prompt = expanded.prompt;
+            displayPrompt = expanded.displayPrompt;
+            sendMode = expanded.mode ?? agentMode;
+            commandEffect = expanded.effect;
+          }
+          const attachments = sdkAttachments(turnInput.message);
           yield* request("session.send", {
-            prompt: `${buildRuntimeInstructions({ harness: "GitHub Copilot", model: session.model ?? undefined })}\n\n${text}`,
-            displayPrompt: turnInput.message.text || text,
+            prompt: `${buildRuntimeInstructions({ harness: "GitHub Copilot", model: session.model ?? undefined })}\n\n${prompt}`,
+            displayPrompt,
+            ...(attachments.length > 0 ? { attachments } : {}),
             // T3 owns turn queueing, so Copilot's own queue must never hold a turn back: it only
             // drains at session idle, which stays deferred while a detached shell or background
             // agent from an earlier turn is still running.
             mode: "immediate",
-            agentMode: turnInput.runtimePolicy.interactionMode === "plan" ? "plan" : "interactive",
+            agentMode: sendMode,
           });
+          if (commandEffect)
+            yield* request("session.commands.finalizeInvocationEffect", {
+              effect: commandEffect,
+              outcome: "applied",
+            }).pipe(Effect.ignore);
         }).pipe(
           Effect.onError((cause) => {
             const error = Cause.squash(cause);
@@ -1696,9 +1940,11 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               return yield* protocolError("This Copilot turn cannot be steered");
             const text = yield* promptText(args.message);
             // `immediate` interjects into the running turn; background agents keep running.
+            const attachments = sdkAttachments(args.message);
             yield* request("session.send", {
               prompt: text,
               displayPrompt: args.message.text || text,
+              ...(attachments.length > 0 ? { attachments } : {}),
               mode: "immediate",
             });
             turn.steers += 1;

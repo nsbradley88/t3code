@@ -33,7 +33,11 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import { makeCopilotSdkAdapterV2, CopilotSdkSpawnError } from "./copilotSdk/adapter.ts";
+import {
+  makeCopilotSdkAdapterV2,
+  CopilotSdkSpawnError,
+  type CopilotSdkCommandInfo,
+} from "./copilotSdk/adapter.ts";
 import { copilotSdkTransportDisabled, withCopilotSdkTransport } from "./copilotSdk/transport.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -379,9 +383,45 @@ export function makeAcpRegistryAdapterDriver<Config extends AcpRegistrySettings>
         });
         if (driverKind !== "copilot" || copilotSdkTransportDisabled(environment)) return acp;
         const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
+        const coordinator = Option.getOrUndefined(
+          yield* Effect.serviceOption(AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator),
+        );
         const sdk = yield* makeCopilotSdkAdapterV2({
           instanceId: input.instanceId,
           continuationRequests,
+          // The probe already lists Copilot's commands and skills; a session adds project-level
+          // ones, so merge instead of replacing what the probe found.
+          ...(coordinator === undefined
+            ? {}
+            : {
+                publishCommands: Effect.fn("CopilotSdk.publishCommands")(function* (
+                  commands: ReadonlyArray<CopilotSdkCommandInfo>,
+                ) {
+                  const existing = Option.getOrUndefined(
+                    yield* coordinator.getAvailableCommands(input.instanceId),
+                  );
+                  const merged = new Map(
+                    (existing?.slashCommands ?? []).map((command) => [
+                      command.name.toLowerCase(),
+                      command,
+                    ]),
+                  );
+                  for (const command of normalizeAcpRegistryCommands(
+                    commands.map((command) => ({
+                      name: command.name,
+                      description: command.description,
+                      ...(command.hint
+                        ? { input: { type: "text" as const, hint: command.hint } }
+                        : {}),
+                    })),
+                  ).slashCommands)
+                    merged.set(command.name.toLowerCase(), command);
+                  yield* coordinator.publishAvailableCommands(input.instanceId, {
+                    slashCommands: [...merged.values()],
+                    skills: existing?.skills ?? [],
+                  });
+                }),
+              }),
           resolveSpawn: (cwd) =>
             catalog.resolve(settings, cwd, environment).pipe(
               Effect.map((resolved) => ({

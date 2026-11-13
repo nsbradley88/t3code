@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  ChatAttachmentId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -28,7 +29,12 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
-import { makeCopilotSdkAdapterV2, CopilotSdkCapabilitiesV2 } from "./adapter.ts";
+import {
+  makeCopilotSdkAdapterV2,
+  CopilotSdkCapabilitiesV2,
+  type CopilotSdkAdapterV2Options,
+  type CopilotSdkCommandInfo,
+} from "./adapter.ts";
 import type { CopilotSdkCloseInfo, CopilotSdkConnection } from "./connection.ts";
 import { withCopilotSdkTransport } from "./transport.ts";
 
@@ -134,8 +140,10 @@ const makeHarness = Effect.fnUntraced(function* (
   fake: Effect.Success<ReturnType<typeof makeFakeServer>>,
   policy = fullAccess,
   chosen = selection,
+  extra: Partial<CopilotSdkAdapterV2Options> = {},
 ) {
   const adapter = yield* makeCopilotSdkAdapterV2({
+    ...extra,
     instanceId: INSTANCE_ID,
     resolveSpawn: (cwd) => Effect.succeed({ command: "copilot", args: [], env: {}, cwd }),
     openConnection: async () => fake.connection,
@@ -789,6 +797,301 @@ describe("withCopilotSdkTransport", () => {
       const runtime = yield* adapter.openSession({} as never);
       assert.deepStrictEqual(runtime as unknown, { label: "acp" });
     }),
+  );
+});
+
+describe("CopilotSdkAdapterV2 UI integration", () => {
+  const approvalRequired = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    cwd: null,
+  });
+  const MODE = "https://agentclientprotocol.com/protocol/session-modes#";
+  const withOptions = (options: ReadonlyArray<{ id: string; value: string }>) => ({
+    ...selection,
+    options,
+  });
+
+  it.live("applies the picker's Autopilot mode, bypass and reasoning effort", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake, approvalRequired);
+      assert.deepStrictEqual(
+        fake.named("session.permissions.setMode").map((call) => call.params.mode),
+        ["manual"],
+      );
+      const picked = withOptions([
+        { id: "mode", value: `${MODE}autopilot` },
+        { id: "reasoning_effort", value: "high" },
+      ]);
+      const input = {
+        ...(yield* turnInput(harness.providerThread, 1, approvalRequired)),
+        modelSelection: picked,
+      };
+      yield* harness.runtime.startTurn(input);
+      const send = yield* fake.takeCall("session.send");
+      // Autopilot is Copilot's own bypass, so permissions follow the picker, not the lower floor.
+      assert.deepStrictEqual(
+        fake.named("session.permissions.setMode").map((call) => call.params.mode),
+        ["manual", "allow-all"],
+      );
+      assert.strictEqual(fake.named("session.mode.set")[0]?.params.mode, "autopilot");
+      assert.strictEqual(send.params.agentMode, "autopilot");
+      assert.strictEqual(
+        fake.named("session.model.setReasoningEffort")[0]?.params.reasoningEffort,
+        "high",
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("turns bypass on from the allow_all option and never lowers full access", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake, approvalRequired);
+      const input = {
+        ...(yield* turnInput(harness.providerThread, 1, approvalRequired)),
+        modelSelection: withOptions([{ id: "allow_all", value: "on" }]),
+      };
+      yield* harness.runtime.startTurn(input);
+      yield* fake.takeCall("session.send");
+      assert.strictEqual(
+        fake.named("session.permissions.setMode").at(-1)?.params.mode,
+        "allow-all",
+      );
+      yield* Effect.void;
+
+      const fullFake = yield* makeFakeServer();
+      const fullHarness = yield* makeHarness(fullFake);
+      const offInput = {
+        ...(yield* turnInput(fullHarness.providerThread)),
+        modelSelection: withOptions([{ id: "allow_all", value: "off" }]),
+      };
+      yield* fullHarness.runtime.startTurn(offInput);
+      yield* fullFake.takeCall("session.send");
+      assert.deepStrictEqual(
+        fullFake.named("session.permissions.setMode").map((call) => call.params.mode),
+        ["allow-all"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("keeps T3 plan mode over the picker and returns to the picked mode afterwards", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      const planPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+        cwd: null,
+      });
+      yield* harness.runtime.startTurn({
+        ...(yield* turnInput(harness.providerThread, 1, planPolicy)),
+        modelSelection: withOptions([{ id: "mode", value: `${MODE}agent` }]),
+      });
+      yield* fake.takeCall("session.send");
+      assert.strictEqual(fake.named("session.mode.set").at(-1)?.params.mode, "plan");
+      yield* fake.emit("assistant.idle");
+      yield* harness.takeEvent("turn.terminal");
+      yield* harness.runtime.startTurn({
+        ...(yield* turnInput(harness.providerThread, 2)),
+        modelSelection: withOptions([{ id: "mode", value: `${MODE}agent` }]),
+      });
+      yield* fake.takeCall("session.send");
+      assert.strictEqual(fake.named("session.mode.set").at(-1)?.params.mode, "interactive");
+      // Bypass held across the whole plan round trip.
+      assert.deepStrictEqual(
+        [...new Set(fake.named("session.permissions.setMode").map((call) => call.params.mode))],
+        ["allow-all"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("publishes the session's slash commands and refreshes them when they change", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const published = yield* Queue.unbounded<ReadonlyArray<CopilotSdkCommandInfo>>();
+      fake.queue("session.commands.list", {
+        commands: [
+          { name: "review", description: "Review code", input: { hint: "what to review" } },
+          { name: "usage", description: "Show usage", aliases: ["u"] },
+        ],
+      });
+      yield* makeHarness(fake, fullAccess, selection, {
+        publishCommands: (commands) => Queue.offer(published, commands).pipe(Effect.asVoid),
+      });
+      assert.deepStrictEqual(yield* Queue.take(published), [
+        { name: "review", description: "Review code", hint: "what to review" },
+        { name: "usage", description: "Show usage" },
+      ]);
+      yield* fake.emit("commands.changed", { commands: [{ name: "init", description: "Init" }] });
+      assert.deepStrictEqual(yield* Queue.take(published), [{ name: "init", description: "Init" }]);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  const commandFake = Effect.fnUntraced(function* () {
+    const fake = yield* makeFakeServer();
+    fake.queue("session.commands.list", {
+      commands: [
+        { name: "review", description: "Review code", aliases: ["rv"] },
+        { name: "usage", description: "Show usage" },
+      ],
+    });
+    return fake;
+  });
+  const startCommandTurn = Effect.fnUntraced(function* (
+    harness: Effect.Success<ReturnType<typeof makeHarness>>,
+    text: string,
+  ) {
+    yield* harness.runtime.startTurn(yield* turnInput(harness.providerThread, 1, fullAccess, text));
+  });
+
+  it.live("runs a text-only slash command without a model turn", () =>
+    Effect.gen(function* () {
+      const fake = yield* commandFake();
+      const harness = yield* makeHarness(fake);
+      fake.queue("session.commands.invoke", { kind: "text", text: "12 of 300 requests used" });
+      yield* startCommandTurn(harness, "/usage");
+      const message = yield* harness.takeEvent("message.updated", (event) =>
+        event.message.text.includes("12 of 300"),
+      );
+      assert.strictEqual(message.message.role, "assistant");
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.deepStrictEqual(fake.named("session.commands.invoke")[0]?.params, {
+        sessionId: fake.named("session.create")[0]!.params.sessionId,
+        name: "usage",
+        input: "",
+      });
+      assert.strictEqual(fake.named("session.send").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("sends the prompt a slash command expands to, through an alias, and finalizes it", () =>
+    Effect.gen(function* () {
+      const fake = yield* commandFake();
+      const harness = yield* makeHarness(fake);
+      fake.queue("session.commands.invoke", {
+        kind: "agent-prompt",
+        prompt: "Review these files: src",
+        displayPrompt: "/review src",
+        mode: "plan",
+        reservationToken: "token-1",
+      });
+      yield* startCommandTurn(harness, "/rv src");
+      const send = yield* fake.takeCall("session.send");
+      assert.strictEqual(fake.named("session.commands.invoke")[0]?.params.name, "rv");
+      assert.strictEqual(fake.named("session.commands.invoke")[0]?.params.input, "src");
+      assert.ok(String(send.params.prompt).endsWith("Review these files: src"));
+      assert.strictEqual(send.params.displayPrompt, "/review src");
+      assert.strictEqual(send.params.agentMode, "plan");
+      assert.strictEqual(
+        fake.named("session.commands.finalizeInvocationEffect")[0]?.params.outcome,
+        "applied",
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("sends file paths and unknown slash words as ordinary prompts", () =>
+    Effect.gen(function* () {
+      const fake = yield* commandFake();
+      const harness = yield* makeHarness(fake);
+      yield* startCommandTurn(harness, "/usr/bin/ls is missing, what now?");
+      yield* fake.takeCall("session.send");
+      assert.strictEqual(fake.named("session.commands.invoke").length, 0);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("explains commands that need Copilot's interactive terminal", () =>
+    Effect.gen(function* () {
+      const fake = yield* commandFake();
+      const harness = yield* makeHarness(fake);
+      fake.queue("session.commands.invoke", { kind: "select-subcommand", command: "usage" });
+      yield* startCommandTurn(harness, "/usage");
+      const message = yield* harness.takeEvent("message.updated");
+      assert.ok(message.message.text.includes("interactive terminal"));
+      assert.strictEqual((yield* harness.takeEvent("turn.terminal")).status, "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("publishes Copilot's todo table as a live todo list", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      yield* startTurn(harness, fake);
+      fake.queue("session.plan.readSqlTodos", {
+        rows: [
+          { id: "write", title: "Write tests", status: "in_progress" },
+          { id: "ship", title: "Ship it", status: "pending" },
+          { id: "blank", title: "  ", status: "pending" },
+        ],
+      });
+      yield* fake.emit("session.todos_changed");
+      const first = yield* harness.takeEvent("plan.updated");
+      assert.strictEqual(first.plan.kind, "todo_list");
+      if (first.plan.kind !== "todo_list") return;
+      assert.deepStrictEqual(
+        first.plan.steps.map((step) => [step.id, step.status]),
+        [
+          ["write", "running"],
+          ["ship", "pending"],
+        ],
+      );
+      assert.strictEqual(first.plan.status, "active");
+      fake.queue("session.plan.readSqlTodos", {
+        rows: [
+          { id: "write", title: "Write tests", status: "done" },
+          { id: "ship", title: "Ship it", status: "done" },
+        ],
+      });
+      yield* fake.emit("session.todos_changed");
+      const second = yield* harness.takeEvent("plan.updated");
+      // The same plan updates in place; it is not a new list per change.
+      assert.strictEqual(second.plan.id, first.plan.id);
+      assert.strictEqual(second.plan.status, "completed");
+      const item = yield* harness.takeEvent(
+        "turn_item.updated",
+        (event) => event.turnItem.type === "todo_list",
+      );
+      assert.strictEqual(item.turnItem.type, "todo_list");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("attaches images natively on a turn and on a steer", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      const image = {
+        type: "image" as const,
+        id: ChatAttachmentId.make("shot-1"),
+        name: "shot.png",
+        mimeType: "image/png",
+        sizeBytes: 12,
+      };
+      const base = yield* turnInput(harness.providerThread);
+      const input = { ...base, message: { ...base.message, attachments: [image] } };
+      yield* harness.runtime.startTurn(input);
+      const send = yield* fake.takeCall("session.send");
+      const attachments = send.params.attachments as Array<Record<string, unknown>>;
+      assert.strictEqual(attachments.length, 1);
+      assert.strictEqual(attachments[0]?.type, "file");
+      assert.strictEqual(attachments[0]?.displayName, "shot.png");
+      assert.strictEqual(attachments[0]?.mimeType, "image/png");
+      assert.ok(String(attachments[0]?.path).endsWith("shot-1"));
+      const running = yield* harness.takeEvent(
+        "provider_turn.updated",
+        (event) => event.providerTurn.status === "running",
+      );
+      yield* harness.runtime.steerTurn({
+        threadId: THREAD_ID,
+        runId: input.runId,
+        providerThread: harness.providerThread,
+        providerTurnId: running.providerTurn.id,
+        message: { ...input.message, text: "look at this instead" },
+      });
+      const steer = fake.named("session.send")[1]!;
+      assert.strictEqual((steer.params.attachments as unknown[]).length, 1);
+      assert.strictEqual(steer.params.mode, "immediate");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });
 

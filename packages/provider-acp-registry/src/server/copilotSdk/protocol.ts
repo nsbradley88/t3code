@@ -1,9 +1,14 @@
 import type {
+  ModelSelection,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemStatus,
   ProviderApprovalDecision,
   RuntimeMode,
 } from "@t3tools/contracts";
+import {
+  getModelSelectionBooleanOptionValue,
+  getModelSelectionStringOptionValue,
+} from "@t3tools/shared/model";
 
 /** The slice of Copilot's `api.schema.json` / `session-events` the adapter relies on. */
 
@@ -17,6 +22,57 @@ export type CopilotSessionMode = "interactive" | "plan" | "autopilot";
  */
 export function copilotPermissionModeForRuntimeMode(mode: RuntimeMode): CopilotPermissionMode {
   return mode === "full-access" ? "allow-all" : "manual";
+}
+
+const COPILOT_MODE_URI = "https://agentclientprotocol.com/protocol/session-modes#";
+
+/**
+ * What the model picker chose through Copilot's own `mode`, `allow_all` and `reasoning_effort`
+ * options, which the provider snapshot publishes per model.
+ */
+export interface CopilotPickerChoices {
+  readonly sessionMode: CopilotSessionMode | undefined;
+  readonly allowAll: boolean;
+  readonly reasoningEffort: string | undefined;
+}
+
+export function copilotPickerChoices(selection: ModelSelection): CopilotPickerChoices {
+  const value = (id: string) => getModelSelectionStringOptionValue(selection, id);
+  const rawMode = value("mode") ?? value("_t3/session-mode");
+  const mode = rawMode?.startsWith(COPILOT_MODE_URI)
+    ? rawMode.slice(COPILOT_MODE_URI.length)
+    : rawMode;
+  const allowAll = value("allow_all");
+  return {
+    sessionMode:
+      mode === "plan"
+        ? "plan"
+        : mode === "autopilot"
+          ? "autopilot"
+          : mode === "agent" || mode === "interactive"
+            ? "interactive"
+            : undefined,
+    allowAll:
+      allowAll === "on" ||
+      allowAll === "true" ||
+      getModelSelectionBooleanOptionValue(selection, "allow_all") === true,
+    reasoningEffort: value("reasoning_effort") ?? value("reasoningEffort"),
+  };
+}
+
+/**
+ * T3's runtime mode sets the floor (full-access is bypass); the picker can only raise it, so an
+ * `allow_all: off` default never lowers a thread that runs in full-access.
+ */
+export function copilotPermissionModeForSelection(
+  mode: RuntimeMode,
+  picks: CopilotPickerChoices,
+): CopilotPermissionMode {
+  return copilotPermissionModeForRuntimeMode(mode) === "allow-all" ||
+    picks.allowAll ||
+    picks.sessionMode === "autopilot"
+    ? "allow-all"
+    : "manual";
 }
 
 export interface CopilotPermissionRequest {
