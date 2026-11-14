@@ -45,6 +45,7 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
+import { makeChildToolRows } from "./childToolRows.ts";
 import {
   openCopilotSdkConnection,
   type CopilotSdkConnection,
@@ -63,6 +64,15 @@ import {
   type CopilotPermissionMode,
   type CopilotSessionMode,
 } from "./protocol.ts";
+import {
+  discardedTurns,
+  forkCutoffBefore,
+  isTurnStart,
+  journalMessages,
+  readJournal,
+  resolveBoundaryEvent,
+  type BoundaryCandidate,
+} from "./threadOps.ts";
 
 const COPILOT_PROVIDER = ProviderDriverKind.make("copilot");
 
@@ -92,10 +102,10 @@ export const CopilotSdkCapabilitiesV2 = {
   },
   threads: {
     canCreateEmptyThread: true,
-    canReadThreadSnapshot: false,
-    canRollbackThread: false,
-    canForkThread: false,
-    canForkFromTurn: false,
+    canReadThreadSnapshot: true,
+    canRollbackThread: true,
+    canForkThread: true,
+    canForkFromTurn: true,
     canForkFromSubagentThread: false,
     exposesNativeThreadId: true,
   },
@@ -164,9 +174,9 @@ export const CopilotSdkCapabilitiesV2 = {
   checkpointing: {
     appCanCheckpointFilesystem: true,
     supportsNestedCheckpointScopes: false,
-    providerCanRollbackConversation: false,
-    providerRollbackReturnsSnapshot: false,
-    providerCanReadConversationSnapshot: false,
+    providerCanRollbackConversation: true,
+    providerRollbackReturnsSnapshot: true,
+    providerCanReadConversationSnapshot: true,
   },
   identity: {
     nativeThreadIds: "strong",
@@ -205,6 +215,7 @@ export interface CopilotSdkAdapterV2Options {
 }
 
 interface SdkEvent {
+  readonly id?: string;
   readonly type: string;
   readonly agentId?: string;
   readonly data?: Record<string, unknown>;
@@ -1192,6 +1203,16 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         return undefined;
       });
 
+      const childToolRows = makeChildToolRows({
+        driver: COPILOT_PROVIDER,
+        emit,
+        turnItemId: (nativeItemId) =>
+          idAllocator.derive.turnItemFromProviderItem({ driver: COPILOT_PROVIDER, nativeItemId }),
+        nodeId: (nativeItemId) =>
+          idAllocator.derive.nodeFromProviderItem({ driver: COPILOT_PROVIDER, nativeItemId }),
+        nativeRef,
+      });
+
       const emitChildRoot = Effect.fnUntraced(function* (
         child: SubagentThread,
         status: "running" | "completed" | "failed" | "cancelled",
@@ -1321,6 +1342,10 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         event: SdkEvent,
       ) {
         const data = event.data ?? {};
+        if (childToolRows.handles(event.type)) {
+          yield* childToolRows.handle(child, event);
+          return;
+        }
         const text = (asString(data.content) ?? "").trim();
         if (event.type === "user.message" && !child.promptSeen && text) {
           child.promptSeen = true;
@@ -1344,6 +1369,28 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const data = event.data ?? {};
         const isSub = event.agentId !== undefined || data.parentToolCallId !== undefined;
         switch (event.type) {
+          case "user.message": {
+            // The event that begins this turn is where rewind and fork cut history.
+            if (
+              isSub ||
+              event.id === undefined ||
+              turn.providerTurn.nativeTurnRef?.strength === "strong" ||
+              !isTurnStart({
+                type: event.type,
+                agentId: event.agentId,
+                delivery: asString(data.delivery),
+              })
+            )
+              return;
+            turn.providerTurn = { ...turn.providerTurn, nativeTurnRef: nativeRef(event.id) };
+            yield* emit({
+              type: "provider_turn.updated",
+              driver: COPILOT_PROVIDER,
+              threadId: turn.input.threadId,
+              providerTurn: turn.providerTurn,
+            });
+            return;
+          }
           case "assistant.message_delta": {
             if (isSub) return;
             const id = asString(data.messageId);
@@ -1489,6 +1536,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             });
             if (child) {
               child.finished = true;
+              yield* childToolRows.close(child, status);
               yield* emitChildRoot(child, status);
             }
             yield* refreshTasks();
@@ -1661,6 +1709,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         for (const child of subagentThreads.values()) {
           if (child.finished) continue;
           child.finished = true;
+          yield* childToolRows.close(child, "failed");
           yield* emitChildRoot(child, "failed");
         }
         yield* cancelPending();
@@ -2267,30 +2316,225 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
               ),
             ),
         ),
-        readThreadSnapshot: (args) =>
-          Effect.succeed({
-            providerThread: args.providerThread,
-            providerTurns: [],
-            messages: [],
-            runtimeRequests: [...pending.values()].map((entry) => entry.request),
-          }),
-        rollbackThread: (args) =>
-          Effect.fail(
-            new ProviderAdapter.ProviderAdapterRollbackThreadError({
-              driver: COPILOT_PROVIDER,
-              providerThreadId: args.providerThread.id,
-              checkpointId: args.target.checkpointId,
-              cause: "GitHub Copilot does not support conversation rollback in T3 Code.",
-            }),
-          ),
-        forkThread: (args) =>
-          Effect.fail(
-            new ProviderAdapter.ProviderAdapterForkThreadError({
-              driver: COPILOT_PROVIDER,
-              providerThreadId: args.sourceProviderThread.id,
-              cause: "GitHub Copilot does not support native forks in T3 Code.",
-            }),
-          ),
+        readThreadSnapshot: Effect.fn("CopilotSdkAdapter.readThreadSnapshot")(
+          function* (args) {
+            const nativeId = args.providerThread.nativeThreadRef?.nativeId;
+            if (nativeId == null)
+              return yield* protocolError("This thread has no Copilot session to snapshot");
+            const journal = yield* readJournal(
+              (method, params) => request(method, params, 60_000),
+              nativeId,
+            );
+            if (journal.truncated)
+              return yield* protocolError("The Copilot session history is too long to snapshot");
+            return {
+              providerThread: validateThread(args.providerThread)
+                ? (thread ?? args.providerThread)
+                : args.providerThread,
+              providerTurns: [],
+              messages: journalMessages({
+                events: journal.events,
+                threadId: args.providerThread.appThreadId ?? input.threadId,
+                fallbackTime: args.providerThread.createdAt,
+                messageId: (eventId) =>
+                  idAllocator.derive.messageFromProviderItem({
+                    driver: COPILOT_PROVIDER,
+                    nativeItemId: `${nativeId}:snapshot:${eventId}`,
+                  }),
+              }),
+              runtimeRequests: [...pending.values()].map((entry) => entry.request),
+            };
+          },
+          (effect, args) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterReadThreadSnapshotError({
+                    driver: COPILOT_PROVIDER,
+                    providerThreadId: args.providerThread.id,
+                    cause,
+                  }),
+              ),
+            ),
+        ),
+        // Conversation only: T3's checkpoint service restores files itself right after this returns,
+        // so also restoring them here would restore the same files twice.
+        rollbackThread: Effect.fn("CopilotSdkAdapter.rollbackThread")(
+          function* (args) {
+            if (!validateThread(args.providerThread))
+              return yield* protocolError(
+                "Copilot rollback requested for a thread this session does not host",
+              );
+            if (active)
+              return yield* protocolError("Cannot roll back while a Copilot turn is running");
+            if (wake)
+              return yield* protocolError("Cannot roll back while Copilot work awaits a turn");
+            const unchanged = () => ({
+              providerThread: thread ?? args.providerThread,
+              providerTurns: [],
+              messages: [],
+              runtimeRequests: [],
+            });
+            const turns = discardedTurns({
+              target:
+                args.target.type === "thread_start"
+                  ? { type: "thread_start" }
+                  : { type: "provider_turn", providerTurn: args.target.providerTurn },
+              providerThreadTurns: args.providerThreadTurns,
+            });
+            if (turns.length === 0) return unchanged();
+            const listing = asRecord(yield* request("session.history.listRewindPoints"));
+            const unavailable = asString(listing.unavailableReason);
+            if (unavailable !== undefined)
+              return yield* protocolError(`Copilot cannot rewind this session (${unavailable})`);
+            const candidates = (Array.isArray(listing.points) ? listing.points : []).flatMap(
+              (point): ReadonlyArray<BoundaryCandidate> => {
+                const fields = asRecord(point);
+                const id = asString(fields.eventId);
+                const at = Date.parse(asString(fields.timestamp) ?? "");
+                return id === undefined ? [] : [{ id, timestampMs: Number.isNaN(at) ? null : at }];
+              },
+            );
+            // No discarded turn begins at a point Copilot can rewind to (a wake or compaction), so
+            // its history has nothing to cut.
+            const eventId = resolveBoundaryEvent(candidates, turns);
+            if (eventId === undefined) return unchanged();
+            const result = asRecord(
+              yield* request("session.history.rewind", { eventId, mode: "conversation" }, 120_000),
+            );
+            const outcome = asString(result.outcome);
+            // These outcomes rewound the conversation; only their cleanup of side stores failed.
+            if (
+              outcome !== "success" &&
+              outcome !== "checkpoint-cleanup-failed" &&
+              outcome !== "snapshot-prune-failed"
+            )
+              return yield* protocolError(
+                `Copilot did not rewind the session (${outcome ?? "no outcome"})`,
+              );
+            yield* updateThread({
+              nativeConversationHeadRef:
+                args.target.type === "provider_turn"
+                  ? (args.target.providerTurn.nativeTurnRef ?? null)
+                  : null,
+            });
+            return unchanged();
+          },
+          (effect, args) =>
+            effect.pipe(
+              commands.withPermits(1),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterRollbackThreadError({
+                    driver: COPILOT_PROVIDER,
+                    providerThreadId: args.providerThread.id,
+                    checkpointId: args.target.checkpointId,
+                    cause,
+                  }),
+              ),
+            ),
+        ),
+        forkThread: Effect.fn("CopilotSdkAdapter.forkThread")(
+          function* (args) {
+            if (active) return yield* protocolError("Cannot fork while a Copilot turn is running");
+            const source = args.sourceProviderThread;
+            const sourceId = source.nativeThreadRef?.nativeId;
+            if (sourceId == null)
+              return yield* protocolError("The fork source has no Copilot session");
+            const sourceTurns = (args.sourceProviderTurns ?? []).filter(
+              (turn) => turn.providerThreadId === source.id,
+            );
+            const target =
+              args.providerTurnId === undefined
+                ? undefined
+                : sourceTurns.find((turn) => turn.id === args.providerTurnId);
+            if (args.providerTurnId !== undefined && target === undefined)
+              return yield* protocolError("The Copilot fork target turn is missing");
+            // A fork keeps history through the target turn: cut just before the next turn's message.
+            let toEventId: string | undefined;
+            const later =
+              target === undefined
+                ? []
+                : discardedTurns({
+                    target: { type: "provider_turn", providerTurn: target },
+                    providerThreadTurns: sourceTurns,
+                  });
+            if (later.length > 0) {
+              const journal = yield* readJournal(
+                (method, params) => request(method, params, 60_000),
+                sourceId,
+              );
+              if (journal.truncated)
+                return yield* protocolError("The Copilot session history is too long to fork");
+              const boundary = resolveBoundaryEvent(
+                journal.events
+                  .filter(isTurnStart)
+                  .map((event) => ({ id: event.id, timestampMs: event.timestampMs })),
+                later,
+              );
+              if (boundary !== undefined) {
+                const cutoff = forkCutoffBefore(journal.events, boundary);
+                if (cutoff === null)
+                  return yield* protocolError("Copilot has no history before that turn to fork");
+                toEventId = cutoff;
+              }
+            }
+            const forked = asRecord(
+              yield* request(
+                "sessions.fork",
+                { sessionId: sourceId, ...(toEventId === undefined ? {} : { toEventId }) },
+                120_000,
+              ),
+            );
+            const forkedId = asString(forked.sessionId);
+            if (forkedId === undefined)
+              return yield* protocolError("Copilot did not return the forked session");
+            const now = yield* DateTime.now;
+            // Resuming the forked session binds this runtime to it for the target thread's turns.
+            return yield* register({
+              threadId: args.targetThreadId,
+              modelSelection: args.modelSelection ?? input.modelSelection,
+              runtimePolicy: args.runtimePolicy ?? input.runtimePolicy,
+              existingProviderThread: {
+                ...source,
+                id: idAllocator.derive.providerThread({
+                  driver: COPILOT_PROVIDER,
+                  providerInstanceId: options.instanceId,
+                  nativeThreadId: forkedId,
+                }),
+                appThreadId: args.targetThreadId,
+                providerSessionId: input.providerSessionId,
+                providerInstanceId: options.instanceId,
+                ownerNodeId: args.ownerNodeId ?? null,
+                nativeThreadRef: nativeRef(forkedId),
+                nativeConversationHeadRef: null,
+                firstRunOrdinal: null,
+                lastRunOrdinal: null,
+                handoffIds: [],
+                forkedFrom: {
+                  providerThreadId: source.id,
+                  ...(args.providerTurnId === undefined
+                    ? {}
+                    : { providerTurnId: args.providerTurnId }),
+                },
+                createdAt: now,
+                updatedAt: now,
+              },
+            });
+          },
+          (effect, args) =>
+            effect.pipe(
+              commands.withPermits(1),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterForkThreadError({
+                    driver: COPILOT_PROVIDER,
+                    providerThreadId: args.sourceProviderThread.id,
+                    cause,
+                  }),
+              ),
+            ),
+        ),
       };
       return runtime;
     }),

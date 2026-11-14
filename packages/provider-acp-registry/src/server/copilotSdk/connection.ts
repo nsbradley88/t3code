@@ -50,6 +50,57 @@ export interface CopilotSdkSpawnInput {
   readonly env: NodeJS.ProcessEnv;
   readonly cwd: string;
   readonly platform: NodeJS.Platform;
+  /** Replaced in tests; defaults to `taskkill /PID <pid> /T /F`. */
+  readonly runTaskkill?: (pid: number, fallback: () => void) => void;
+}
+
+/** Windows has no process groups; `taskkill /T` is what reaps a process and its descendants. */
+const runWindowsTaskkill = (pid: number, fallback: () => void) => {
+  const taskkill = NodeChildProcess.spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  taskkill.once("error", fallback);
+  // 128 means the process was already gone, which is the outcome wanted.
+  taskkill.once("exit", (code) => {
+    if (code !== 0 && code !== 128 && code !== null) fallback();
+  });
+  taskkill.unref();
+};
+
+/**
+ * Stops the CLI and what it started. Killing the Windows child alone leaves its shells and MCP
+ * servers running, so Windows reaps the whole tree; elsewhere the CLI leads its own process group.
+ */
+export function terminateCopilotProcess(input: {
+  readonly platform: NodeJS.Platform;
+  readonly pid: number | undefined;
+  readonly killChild: (signal: NodeJS.Signals) => void;
+  readonly killGroup: (pid: number, signal: NodeJS.Signals) => void;
+  readonly runTaskkill: (pid: number, fallback: () => void) => void;
+}): void {
+  const fallback = () => {
+    try {
+      input.killChild("SIGTERM");
+    } catch {
+      // Already exited.
+    }
+  };
+  if (input.platform === "win32") {
+    if (input.pid === undefined) return fallback();
+    try {
+      input.runTaskkill(input.pid, fallback);
+    } catch {
+      fallback();
+    }
+    return;
+  }
+  try {
+    if (input.pid !== undefined) input.killGroup(input.pid, "SIGTERM");
+    else input.killChild("SIGTERM");
+  } catch {
+    fallback();
+  }
 }
 
 /** Arguments that turn a resolved `copilot` command into the SDK JSON-RPC server. */
@@ -276,13 +327,13 @@ export async function openCopilotSdkConnection(
   });
   const killTree = () => {
     if (child.exitCode !== null || child.signalCode !== null) return;
-    try {
-      if (input.platform !== "win32" && child.pid !== undefined)
-        process.kill(-child.pid, "SIGTERM");
-      else child.kill("SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
+    terminateCopilotProcess({
+      platform: input.platform,
+      pid: child.pid,
+      killChild: (signal) => void child.kill(signal),
+      killGroup: (pid, signal) => process.kill(-pid, signal),
+      runTaskkill: input.runTaskkill ?? runWindowsTaskkill,
+    });
   };
   const { connection, notifyClosed } = makeFramedConnection({
     readable: child.stdout,

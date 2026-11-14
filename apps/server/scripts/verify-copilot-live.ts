@@ -35,7 +35,19 @@ const { values } = NodeUtil.parseArgs({
     timeout: { type: "string", default: "420" },
   },
 });
-const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "todos", "child", "subagent"];
+const SCENARIOS = [
+  "catalog",
+  "steer",
+  "interrupt",
+  "modes",
+  "usage",
+  "todos",
+  "child",
+  "subagent",
+  "rollback",
+  "fork",
+  "childtools",
+];
 const selected = values.scenario === "all" ? SCENARIOS : values.scenario.split(",");
 for (const name of selected) NodeAssert.ok(SCENARIOS.includes(name), `unknown scenario ${name}`);
 const timeoutMs = Number(values.timeout) * 1000;
@@ -597,6 +609,139 @@ try {
         NodeAssert.ok(/DONE/.test(done.value.result ?? ""), "the subagent result lost the reply");
         NodeAssert.equal(child.thread.lineage.relationshipToParent, "subagent");
         return { childThreadId: childId, roles, result: done.value.result };
+      });
+
+      // Thread operations: Copilot keeps two code words across turns, then loses or keeps them.
+      const completedRuns = (projection: OrchestrationV2ThreadProjection) =>
+        projection.runs.filter((candidate) => candidate.status === "completed");
+      const answerOf = (projection: OrchestrationV2ThreadProjection) => {
+        const latest = completedRuns(projection).toSorted(
+          (left, right) => right.ordinal - left.ordinal,
+        )[0];
+        return projection.messages
+          .filter((message) => message.runId === latest?.id && message.role === "assistant")
+          .map((message) => message.text)
+          .join("\n");
+      };
+      const askCodeWords =
+        "List every code word I asked you to remember, comma separated, or NONE.";
+      const twoWordThread = async (title: string) => {
+        const threadId = await launch(title, "Remember the code word ALPHA. Reply with just OK.");
+        await waitFor("the first turn", threadId, (p) => completedRuns(p).length >= 1);
+        await send(threadId, "Remember the code word BRAVO. Reply with just OK.", {
+          type: "start_immediately",
+        });
+        const settled = await waitFor("the second turn", threadId, (p) =>
+          completedRuns(p).length >= 2 ? p : undefined,
+        );
+        return { threadId, projection: settled.value };
+      };
+
+      await scenario("rollback", async () => {
+        const { threadId, projection } = await twoWordThread("Copilot rollback");
+        const firstRun = projection.runs.toSorted((a, b) => a.ordinal - b.ordinal)[0]!;
+        const checkpoint = (
+          await waitFor("the first checkpoint", threadId, (p) =>
+            p.checkpoints.find((c) => c.runId === firstRun.id && c.status === "ready"),
+          )
+        ).value;
+        // Files are restored by T3's checkpoints, not Copilot, so only the conversation is checked here.
+        await dispatch({
+          type: "checkpoint.rollback",
+          threadId,
+          scopeId: checkpoint.scopeId,
+          checkpointId: checkpoint.id,
+          restoreFiles: false,
+        });
+        await waitFor("the second run to be rolled back", threadId, (p) =>
+          p.runs.some((r) => r.ordinal === 2 && r.status === "rolled_back"),
+        );
+        await send(threadId, askCodeWords, { type: "start_immediately" });
+        const answered = await waitFor("the memory check", threadId, (p) =>
+          completedRuns(p).length >= 2 ? p : undefined,
+        );
+        await saveProjection("rollback-projection", threadId);
+        const text = answerOf(answered.value);
+        NodeAssert.ok(/ALPHA/i.test(text), `the kept turn was forgotten: ${text}`);
+        NodeAssert.ok(!/BRAVO/i.test(text), `the rolled-back turn is still remembered: ${text}`);
+        return { remembers: text.slice(0, 120) };
+      });
+
+      await scenario("fork", async () => {
+        const { threadId, projection } = await twoWordThread("Copilot fork source");
+        const firstRun = projection.runs.toSorted((a, b) => a.ordinal - b.ordinal)[0]!;
+        const targetThreadId = ThreadId.make(NodeCrypto.randomUUID());
+        await dispatch({
+          type: "thread.fork",
+          createdBy: "user",
+          creationSource: "web",
+          sourceThreadId: threadId,
+          targetThreadId,
+          sourcePoint: { type: "run", runId: firstRun.id },
+          title: "Copilot fork",
+        });
+        await send(targetThreadId, askCodeWords, { type: "start_immediately" });
+        const answered = await waitFor("the fork's answer", targetThreadId, (p) =>
+          completedRuns(p).length >= 1 ? p : undefined,
+        );
+        await saveProjection("fork-projection", targetThreadId);
+        const text = answerOf(answered.value);
+        NodeAssert.ok(/ALPHA/i.test(text), `the fork lost the kept turn: ${text}`);
+        NodeAssert.ok(!/BRAVO/i.test(text), `the fork kept a turn after its fork point: ${text}`);
+        const lineage = answered.value.providerThreads.find((t) => t.forkedFrom != null);
+        NodeAssert.ok(lineage?.forkedFrom, "the fork has no native lineage");
+        // The source thread is untouched by the fork.
+        const source = await projectionOf(threadId);
+        NodeAssert.equal(completedRuns(source).length, 2);
+        return { remembers: text.slice(0, 120), forkedFrom: lineage.forkedFrom.providerThreadId };
+      });
+
+      await scenario("childtools", async () => {
+        const threadId = await launch(
+          "Copilot child tools",
+          "Use your task tool to start ONE general-purpose agent whose job is: run `echo hello-from-agent` in the shell, then run `ls -la` in the shell, then reply with the single word DONE. Wait for it to finish, then tell me what it said.",
+        );
+        const done = await waitFor(
+          "a completed subagent",
+          threadId,
+          (projection) => projection.subagents.find((agent) => agent.status === "completed"),
+          240_000,
+        );
+        const childId = done.value.childThreadId;
+        NodeAssert.ok(childId, "the subagent has no child thread");
+        const child = await waitFor("the child's tool rows", ThreadId.make(childId), (p) => {
+          const rows = p.turnItems.filter(
+            (item) => item.type !== "assistant_message" && item.type !== "user_message",
+          );
+          return rows.length >= 2 && rows.every((row) => row.status !== "running") ? p : undefined;
+        });
+        NodeFS.writeFileSync(
+          NodePath.join(evidence, "childtools-projection.json"),
+          JSON.stringify(child.value, null, 2),
+        );
+        const rows = child.value.turnItems.filter(
+          (item) => item.type !== "assistant_message" && item.type !== "user_message",
+        );
+        NodeAssert.ok(
+          rows.some((row) => /hello-from-agent/.test(JSON.stringify(row))),
+          "the agent's echo command has no row in the child thread",
+        );
+        NodeAssert.ok(
+          rows.every((row) => row.threadId === childId),
+          "a tool row landed outside the child thread",
+        );
+        const parent = await projectionOf(threadId);
+        NodeAssert.ok(
+          !parent.turnItems.some(
+            (item) =>
+              item.type === "command_execution" && /hello-from-agent/.test(JSON.stringify(item)),
+          ),
+          "the agent's tool rows leaked into the parent thread",
+        );
+        return {
+          childThreadId: childId,
+          rows: rows.map((row) => `${row.type}:${row.status}`),
+        };
       });
     });
   }).pipe(Effect.scoped, Effect.provide(layerProtocol), Effect.timeout(timeoutMs));
