@@ -1384,6 +1384,23 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             const toolCallId = asString(data.toolCallId);
             const toolName = asString(data.toolName) ?? "tool";
             if (!toolCallId || isSub) return;
+            if (toolName === "task_complete") {
+              // Autopilot ends a task with this call, and its summary is often the only place the
+              // answer appears; the closing assistant message can be empty. Show it as the reply,
+              // unless the last reply already says the same.
+              const summary = (asString(asRecord(data.arguments).summary) ?? "").trim();
+              const lastReply = [...turn.items.values()]
+                .filter((item) => item.kind === "assistant" && item.text.trim().length > 0)
+                .at(-1);
+              if (summary && lastReply?.text.trim() !== summary) {
+                yield* touch(turn, toolCallId, {
+                  kind: "assistant",
+                  text: summary,
+                  status: "completed",
+                });
+              }
+              return;
+            }
             // Subagent spawns, intent reports and plan exits have dedicated rows.
             if (["task", "report_intent", "exit_plan_mode", "ask_user"].includes(toolName)) return;
             yield* touch(
