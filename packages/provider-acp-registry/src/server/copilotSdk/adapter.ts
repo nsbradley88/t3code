@@ -105,8 +105,11 @@ export const CopilotSdkCapabilitiesV2 = {
     emitsTurnCompleted: true,
     supportsInterrupt: true,
     supportsActiveSteering: true,
-    // A steer cancels the running tool call and the model answers the new message next.
+    // An operator steer backgrounds the running tool call and the model answers the new message
+    // next. A message from another agent or the server (sent with an agent source) waits for the
+    // running tool and reaches the model at its next call.
     activeSteeringInterruptsTools: true,
+    agentSteeringInterruptsTools: false,
     activeSteeringAcceptsAttachments: true,
     supportsSteeringByInterruptRestart: false,
     supportsQueuedMessages: true,
@@ -2148,10 +2151,17 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
             const text = yield* promptText(args.message);
             // `immediate` interjects into the running turn; background agents keep running.
             const attachments = sdkAttachments(args.message);
+            // An agent source makes Copilot fold the message in at the next model call instead of
+            // backgrounding the running tool for it; operator input keeps the interjecting path.
+            const source =
+              args.message.createdBy === "agent" || args.message.senderThreadId !== undefined
+                ? `agent-${args.message.senderThreadId ?? args.message.creationSource}`
+                : undefined;
             yield* request("session.send", {
               prompt: text,
               displayPrompt: args.message.text || text,
               ...(attachments.length > 0 ? { attachments } : {}),
+              ...(source === undefined ? {} : { source }),
               mode: "immediate",
             });
             turn.steers += 1;

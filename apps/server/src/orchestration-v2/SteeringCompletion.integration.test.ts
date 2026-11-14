@@ -45,15 +45,22 @@ it.effect.each(
       [true, "settled only"],
       [false, "during continuation"],
       ["question", "during delivery"],
+      [true, "after delivery", "agent-safe"],
     ] as const
-  ).map(([kind, timing]) => ({
+  ).map(([kind, timing, steering]) => ({
     mailbox: kind === true,
     question: kind === "question",
     timing,
+    agentSafe: steering === "agent-safe",
     label:
-      kind === "question" ? "delegated task question" : kind ? "mailbox notification" : "steering",
+      (kind === "question"
+        ? "delegated task question"
+        : kind
+          ? "mailbox notification"
+          : "steering") +
+      (steering === "agent-safe" ? " over tool-interrupting operator steering" : ""),
   })),
-)("delivers $label when completion wins $timing", ({ mailbox, question, timing }) =>
+)("delivers $label when completion wins $timing", ({ mailbox, question, timing, agentSafe }) =>
   Effect.scoped(
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace(`steering-completion-${timing.replaceAll(" ", "-")}`);
@@ -67,7 +74,9 @@ it.effect.each(
         turns: {
           ...CodexProviderCapabilitiesV2.turns,
           supportsActiveSteering: timing !== "without native steering",
-          activeSteeringInterruptsTools: timing === "with interrupting native steering",
+          activeSteeringInterruptsTools:
+            agentSafe || timing === "with interrupting native steering",
+          ...(agentSafe ? { agentSteeringInterruptsTools: false } : {}),
         },
       };
       const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {

@@ -35,7 +35,23 @@ const { values } = NodeUtil.parseArgs({
     timeout: { type: "string", default: "420" },
   },
 });
-const SCENARIOS = ["catalog", "steer", "interrupt", "modes", "usage", "todos", "child", "subagent"];
+const SCENARIOS = [
+  "catalog",
+  "steer",
+  "xthread",
+  "xthread-queued-then-operator",
+  "xthread-rapid",
+  "xthread-pending-then-operator",
+  "xthread-subagent",
+  "delegate-default",
+  "delegate-autopilot",
+  "interrupt",
+  "modes",
+  "usage",
+  "todos",
+  "child",
+  "subagent",
+];
 const selected = values.scenario === "all" ? SCENARIOS : values.scenario.split(",");
 for (const name of selected) NodeAssert.ok(SCENARIOS.includes(name), `unknown scenario ${name}`);
 const timeoutMs = Number(values.timeout) * 1000;
@@ -374,6 +390,287 @@ try {
           queuedRuns: after.runs.length - 1,
         };
       });
+
+      const STEER_TASK =
+        "Run exactly one shell command: `sleep 40; echo TOOLDONE`. Wait for it to finish (do not run it in the background), then reply with the single word FINISHED. Nothing else.";
+      /** The fixture's `sleep 40` row: its state, and how long it ran once it ended. */
+      const sleepTool = (projection: OrchestrationV2ThreadProjection) =>
+        projection.turnItems.find(
+          (item) => item.type === "command_execution" && item.input?.includes("sleep 40") === true,
+        );
+      const toolStatus = (projection: OrchestrationV2ThreadProjection) => {
+        const item = sleepTool(projection);
+        if (item === undefined) return "not started";
+        if (item.status === "running" || item.completedAt == null) return item.status;
+        // Projections decode timestamps as DateTime values; saved JSON holds ISO strings.
+        const ms = (value: unknown) => Date.parse(JSON.parse(JSON.stringify(value)) as string);
+        const ranS = (ms(item.completedAt) - ms(item.startedAt ?? item.completedAt)) / 1000;
+        return `${item.status} after ${ranS.toFixed(1)}s`;
+      };
+      const agentSend = async (
+        threadId: ThreadId,
+        senderThreadId: ThreadId,
+        text: string,
+        dispatchMode: Record<string, unknown>,
+        extra: Record<string, unknown> = {},
+      ) =>
+        send(threadId, text, dispatchMode, {
+          createdBy: "agent",
+          creationSource: "mcp",
+          senderThreadId,
+          ...extra,
+        });
+      const startSteerFixture = async (title: string) => {
+        const sender = await launch(`${title} sender`, "Reply with exactly the word OK.");
+        const threadId = await launch(title, STEER_TASK);
+        // Wait for the shell command itself; the workspace-preparation row also runs briefly.
+        await waitFor(
+          "the sleep tool",
+          threadId,
+          (p) => sleepTool(p)?.status === "running",
+          180_000,
+        );
+        await sleep(3000);
+        const target = activeRun(await projectionOf(threadId));
+        NodeAssert.ok(target, "turn ended early");
+        return { sender, threadId, target };
+      };
+      /** Polls fast; returns ms from `since` to when `done` first holds, and the tool states then. */
+      const timeUntil = async (
+        threadId: ThreadId,
+        since: number,
+        done: (p: OrchestrationV2ThreadProjection) => boolean,
+        limitMs = 90_000,
+      ) => {
+        const hit = await waitFor("condition", threadId, (p) => done(p) && p, limitMs);
+        return { ms: hit.at - since, tools: toolStatus(hit.value) };
+      };
+      const sawText = (token: string) => (p: OrchestrationV2ThreadProjection) =>
+        p.messages.some((m) => m.role === "assistant" && m.text.includes(token));
+      const finishRun = async (threadId: ThreadId) => {
+        await waitFor(
+          "settle",
+          threadId,
+          (p) => p.runs.every((r) => isTerminalRun(r.status)),
+          150_000,
+        );
+        return await projectionOf(threadId);
+      };
+
+      await scenario("xthread", async () => {
+        const { sender, threadId, target } = await startSteerFixture("xthread");
+        const sentAt = Date.now();
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] The build token is ZETA-7. Include ZETA-7 in your very next reply.",
+          {
+            type: "steer_active",
+            targetRunId: target.id,
+          },
+        );
+        const seen = await timeUntil(threadId, sentAt, sawText("ZETA-7"));
+        const end = await finishRun(threadId);
+        await saveProjection("xthread-projection", threadId);
+        return {
+          seenMs: seen.ms,
+          toolsWhenSeen: seen.tools,
+          toolAtEnd: toolStatus(end),
+          runs: end.runs.map((r) => r.status),
+        };
+      });
+
+      await scenario("xthread-queued-then-operator", async () => {
+        const { sender, threadId, target } = await startSteerFixture("xthread-queued");
+        const agentAt = Date.now();
+        // A queued agent message (send_to_thread mode "queue", or a mailbox notification).
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] The build token is ZETA-7. Include ZETA-7 in your reply.",
+          {
+            type: "queue_after_active",
+          },
+        );
+        await sleep(800);
+        const sentAt = Date.now();
+        await send(
+          threadId,
+          "OPERATOR: say OPERATORSEEN in your next reply.",
+          { type: "steer_active", targetRunId: target.id },
+          { deliveryIntent: "auto" },
+        );
+        const op = await timeUntil(threadId, sentAt, sawText("OPERATORSEEN"));
+        const agentSeenWhenOp = sawText("ZETA-7")(await projectionOf(threadId));
+        const agent = await timeUntil(threadId, agentAt, sawText("ZETA-7"), 150_000);
+        const end = await finishRun(threadId);
+        await saveProjection("xthread-queued-projection", threadId);
+        return {
+          operatorMs: op.ms,
+          operatorToolsWhenSeen: op.tools,
+          agentSeenBeforeOperatorReply: agentSeenWhenOp,
+          agentMs: agent.ms,
+          toolAtEnd: toolStatus(end),
+          runs: end.runs.map((r) => r.status),
+        };
+      });
+
+      await scenario("xthread-rapid", async () => {
+        const { sender, threadId, target } = await startSteerFixture("xthread-rapid");
+        const sentAt = Date.now();
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] Token A is ALPHA-1. Include ALPHA-1 in your reply.",
+          { type: "steer_active", targetRunId: target.id },
+        );
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] Token B is BRAVO-2. Include BRAVO-2 in your reply.",
+          { type: "steer_active", targetRunId: target.id },
+        );
+        await send(
+          threadId,
+          "OPERATOR: say OPERATORSEEN in your next reply.",
+          { type: "steer_active", targetRunId: target.id },
+          { deliveryIntent: "auto" },
+        );
+        const seen = await timeUntil(threadId, sentAt, (p) =>
+          ["ALPHA-1", "BRAVO-2", "OPERATORSEEN"].every((t) => sawText(t)(p)),
+        );
+        const end = await finishRun(threadId);
+        await saveProjection("xthread-rapid-projection", threadId);
+        return {
+          allSeenMs: seen.ms,
+          toolsWhenSeen: seen.tools,
+          toolAtEnd: toolStatus(end),
+          runs: end.runs.map((r) => r.status),
+        };
+      });
+
+      await scenario("xthread-pending-then-operator", async () => {
+        const { sender, threadId, target } = await startSteerFixture("xthread-pending");
+        const agentAt = Date.now();
+        // An agent steer the provider may hold until the running tool ends, then an operator steer.
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] The build token is ZETA-7. Include ZETA-7 in your reply.",
+          { type: "steer_active", targetRunId: target.id },
+        );
+        await sleep(800);
+        const sentAt = Date.now();
+        await send(
+          threadId,
+          "OPERATOR: say OPERATORSEEN in your next reply.",
+          { type: "steer_active", targetRunId: target.id },
+          { deliveryIntent: "auto" },
+        );
+        const op = await timeUntil(threadId, sentAt, sawText("OPERATORSEEN"));
+        const agent = await timeUntil(threadId, agentAt, sawText("ZETA-7"), 150_000);
+        const end = await finishRun(threadId);
+        await saveProjection("xthread-pending-projection", threadId);
+        return {
+          operatorMs: op.ms,
+          toolWhenOperatorSeen: op.tools,
+          agentMs: agent.ms,
+          toolAtEnd: toolStatus(end),
+          runs: end.runs.map((r) => r.status),
+        };
+      });
+
+      await scenario("xthread-subagent", async () => {
+        const sender = await launch("xthread-subagent sender", "Reply with exactly the word OK.");
+        const threadId = await launch(
+          "xthread-subagent",
+          "Use your task tool to run ONE general-purpose agent and wait for it (not in the background). Its only job is to run the shell command `sleep 40; echo SUBDONE` and report the output. When it returns, reply with FINISHED and its output.",
+        );
+        const started = await waitFor(
+          "a running subagent",
+          threadId,
+          (p) => p.subagents.find((agent) => agent.status === "running"),
+          240_000,
+        );
+        await sleep(3000);
+        const target = activeRun(await projectionOf(threadId));
+        NodeAssert.ok(target, "turn ended early");
+        const sentAt = Date.now();
+        await agentSend(
+          threadId,
+          sender,
+          "[from another agent] The build token is ZETA-7. Include ZETA-7 in your very next reply.",
+          { type: "steer_active", targetRunId: target.id },
+        );
+        const seen = await waitFor("ZETA-7", threadId, (p) => sawText("ZETA-7")(p) && p, 150_000);
+        const subagentWhenSeen = seen.value.subagents.find(
+          (a) => a.id === started.value.id,
+        )?.status;
+        const end = await finishRun(threadId);
+        await saveProjection("xthread-subagent-projection", threadId);
+        return {
+          seenMs: seen.at - sentAt,
+          subagentWhenSeen,
+          subagentAtEnd: end.subagents.find((a) => a.id === started.value.id)?.status,
+          runs: end.runs.map((r) => r.status),
+        };
+      });
+
+      const delegateProbe = (label: string, autopilot: boolean) => async () => {
+        const options = autopilot ? [{ id: "mode", value: "autopilot" }] : undefined;
+        const threadId = await launch(
+          `delegate ${label}`,
+          "Call your delegate_task tool THREE times, each with the default async mode (never mode wait), with these tasks: 1) `run the shell command sleep 6; echo ONE, then reply DONE-ONE`, 2) `run the shell command sleep 14; echo TWO, then reply DONE-TWO`, 3) `run the shell command sleep 22; echo THREE, then reply DONE-THREE`. Do not call task_status or any wait tool. After all three are started, run the single shell command `sleep 75; echo ORCHDONE` and wait for it, then reply with exactly FINISHED and the results of the three tasks you have been told about.",
+          options === undefined
+            ? {}
+            : { modelSelection: { instanceId, model: values.model, options } },
+        );
+        const t0 = Date.now();
+        const childDone = new Map<string, number>();
+        const parentGot = new Map<string, { at: number; joinedRunning: boolean }>();
+        let parentSettledAt: number | null = null;
+        for (;;) {
+          const p = await projectionOf(threadId);
+          const now = Date.now();
+          for (const task of p.subagents) {
+            if (["completed", "failed", "cancelled", "interrupted"].includes(task.status))
+              if (!childDone.has(task.id)) childDone.set(task.id, now);
+          }
+          const firstRun = p.runs[0];
+          for (const message of p.messages) {
+            if (message.delegatedCompletion === undefined) continue;
+            if (parentGot.has(message.id)) continue;
+            const run = p.runs.find((r) => r.id === message.runId);
+            parentGot.set(message.id, {
+              at: now,
+              joinedRunning: run !== undefined && run.id === firstRun?.id,
+            });
+          }
+          if (p.runs.length > 0 && p.runs.every((r) => isTerminalRun(r.status))) {
+            parentSettledAt ??= now;
+            if (now - parentSettledAt > 4000) break;
+          }
+          if (now - t0 > 300_000) break;
+          await sleep(300);
+        }
+        await saveProjection(`delegate-${label}-projection`, threadId);
+        const final = await projectionOf(threadId);
+        const first = final.runs[0];
+        return {
+          childDoneAtS: [...childDone.values()].map((v) => Math.round((v - t0) / 100) / 10),
+          parentGotAtS: [...parentGot.values()].map((v) => ({
+            s: Math.round((v.at - t0) / 100) / 10,
+            joinedRunningTurn: v.joinedRunning,
+          })),
+          firstRunEndedAtS:
+            parentSettledAt === null ? null : Math.round((parentSettledAt - t0) / 100) / 10,
+          runs: final.runs.length,
+          firstRunStatus: first?.status,
+          completionWake: final.subagents.map((s) => s.completionWake),
+        };
+      };
+      await scenario("delegate-default", delegateProbe("default", false));
+      await scenario("delegate-autopilot", delegateProbe("autopilot", true));
 
       await scenario("interrupt", async () => {
         const threadId = await launch(
