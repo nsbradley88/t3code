@@ -263,6 +263,7 @@ describe("CopilotSdkAdapterV2", () => {
   it("reports live steering and subagent control", () => {
     assert.strictEqual(CopilotSdkCapabilitiesV2.turns.supportsActiveSteering, true);
     assert.strictEqual(CopilotSdkCapabilitiesV2.turns.activeSteeringInterruptsTools, true);
+    assert.strictEqual(CopilotSdkCapabilitiesV2.turns.agentSteeringInterruptsTools, false);
     assert.strictEqual(CopilotSdkCapabilitiesV2.sessions.supportsRuntimeModeSwitchInSession, true);
   });
 
@@ -303,6 +304,58 @@ describe("CopilotSdkAdapterV2", () => {
       const fake = yield* makeFakeServer();
       yield* makeHarness(fake, fullAccess, { ...selection, model: "default" });
       assert.strictEqual("model" in fake.named("session.create")[0]!.params, false);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("sends agent steers with an agent source and operator steers without one", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      const { input, providerTurn } = yield* startTurn(harness, fake);
+      const steer = (message: typeof input.message) =>
+        harness.runtime.steerTurn({
+          threadId: THREAD_ID,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: providerTurn.id,
+          message,
+        });
+      yield* steer({
+        ...input.message,
+        text: "operator",
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* steer({
+        ...input.message,
+        text: "from another thread",
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("sender-thread"),
+      });
+      yield* steer({
+        ...input.message,
+        text: "relayed by a client",
+        createdBy: "user",
+        creationSource: "mcp",
+        senderThreadId: ThreadId.make("relayed-thread"),
+      });
+      yield* steer({
+        ...input.message,
+        text: "server notification",
+        createdBy: "agent",
+        creationSource: "server",
+      });
+      const sends = fake.named("session.send").slice(1);
+      assert.deepStrictEqual(
+        sends.map((send) => [send.params.mode, send.params.source]),
+        [
+          ["immediate", undefined],
+          ["immediate", "agent-sender-thread"],
+          ["immediate", "agent-relayed-thread"],
+          ["immediate", "agent-server"],
+        ],
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
