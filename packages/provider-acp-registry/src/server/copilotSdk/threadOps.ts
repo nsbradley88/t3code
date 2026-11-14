@@ -140,7 +140,7 @@ export const readJournal = <E>(
   request: (method: string, params: Record<string, unknown>) => Effect.Effect<unknown, E>,
   sessionId: string,
 ): Effect.Effect<JournalRead, E> =>
-  Effect.fn("CopilotJournal.read")(function* () {
+  Effect.gen(function* () {
     const events: Array<JournalEvent> = [];
     let cursor: string | undefined;
     for (let page = 0; page < JOURNAL_MAX_PAGES; page += 1) {
@@ -162,7 +162,7 @@ export const readJournal = <E>(
       if (result.hasMore !== true || cursor === undefined) return { events, truncated: false };
     }
     return { events, truncated: true };
-  })();
+  }).pipe(Effect.withSpan("CopilotJournal.read"));
 
 /** The conversation a thread snapshot shows: main-agent user and assistant messages, in order. */
 export function journalMessages(input: {
