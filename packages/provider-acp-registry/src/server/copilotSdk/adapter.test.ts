@@ -447,6 +447,57 @@ describe("CopilotSdkAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.live("takes an autopilot task_complete summary as the reply when the turn has none", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      yield* startTurn(harness, fake);
+      yield* fake.emit("assistant.message", { messageId: "m1", content: "" });
+      yield* fake.emit("tool.execution_start", {
+        toolCallId: "done-1",
+        toolName: "task_complete",
+        arguments: { summary: "DONE-THREE" },
+      });
+      yield* fake.emit("tool.execution_complete", { toolCallId: "done-1", success: true });
+      yield* fake.emit("assistant.idle");
+      yield* harness.takeEvent("turn.terminal");
+      const replies = harness.allEvents.flatMap((event) =>
+        event.type === "message.updated" && event.message.role === "assistant"
+          ? [event.message.text]
+          : [],
+      );
+      assert.deepStrictEqual([...new Set(replies)], ["DONE-THREE"]);
+      const toolRows = harness.allEvents.filter(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool",
+      );
+      assert.strictEqual(toolRows.length, 0);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.live("does not repeat a task_complete summary the last reply already gave", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeServer();
+      const harness = yield* makeHarness(fake);
+      yield* startTurn(harness, fake);
+      yield* fake.emit("assistant.message", { messageId: "m1", content: "DONE-ONE" });
+      yield* fake.emit("tool.execution_start", {
+        toolCallId: "done-1",
+        toolName: "task_complete",
+        arguments: { summary: "DONE-ONE" },
+      });
+      yield* fake.emit("assistant.idle");
+      yield* harness.takeEvent("turn.terminal");
+      const messageIds = new Set(
+        harness.allEvents.flatMap((event) =>
+          event.type === "message.updated" && event.message.role === "assistant"
+            ? [event.message.id]
+            : [],
+        ),
+      );
+      assert.strictEqual(messageIds.size, 1);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.live("a second turn reports only its own usage", () =>
     Effect.gen(function* () {
       const fake = yield* makeFakeServer();
