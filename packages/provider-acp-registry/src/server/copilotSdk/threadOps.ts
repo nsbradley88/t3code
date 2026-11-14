@@ -136,33 +136,32 @@ export interface JournalRead {
 }
 
 /** Reads a session's persisted journal without activating the session. */
-export const readJournal = <E>(
+export const readJournal = Effect.fn("CopilotJournal.read")(function* <E>(
   request: (method: string, params: Record<string, unknown>) => Effect.Effect<unknown, E>,
   sessionId: string,
-): Effect.Effect<JournalRead, E> =>
-  Effect.gen(function* () {
-    const events: Array<JournalEvent> = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < JOURNAL_MAX_PAGES; page += 1) {
-      const result = record(
-        yield* request("sessions.readPersistedEvents", {
-          sessionId,
-          max: JOURNAL_PAGE_SIZE,
-          direction: "forward",
-          ...(cursor === undefined ? {} : { cursor }),
-        }),
-      );
-      if (text(result.cursorStatus) === "expired") return { events, truncated: true };
-      const batch = Array.isArray(result.events) ? result.events : [];
-      for (const raw of batch) {
-        const parsed = parseJournalEvent(raw);
-        if (parsed !== undefined) events.push(parsed);
-      }
-      cursor = text(result.cursor);
-      if (result.hasMore !== true || cursor === undefined) return { events, truncated: false };
+) {
+  const events: Array<JournalEvent> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < JOURNAL_MAX_PAGES; page += 1) {
+    const result = record(
+      yield* request("sessions.readPersistedEvents", {
+        sessionId,
+        max: JOURNAL_PAGE_SIZE,
+        direction: "forward",
+        ...(cursor === undefined ? {} : { cursor }),
+      }),
+    );
+    if (text(result.cursorStatus) === "expired") return { events, truncated: true };
+    const batch = Array.isArray(result.events) ? result.events : [];
+    for (const raw of batch) {
+      const parsed = parseJournalEvent(raw);
+      if (parsed !== undefined) events.push(parsed);
     }
-    return { events, truncated: true };
-  }).pipe(Effect.withSpan("CopilotJournal.read"));
+    cursor = text(result.cursor);
+    if (result.hasMore !== true || cursor === undefined) return { events, truncated: false };
+  }
+  return { events, truncated: true } satisfies JournalRead;
+});
 
 /** The conversation a thread snapshot shows: main-agent user and assistant messages, in order. */
 export function journalMessages(input: {
