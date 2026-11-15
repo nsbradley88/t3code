@@ -770,6 +770,16 @@ describe("CopilotSdkAdapterV2", () => {
         (event) => event.runtimeRequest.status === "pending",
       );
       assert.strictEqual(requested.runtimeRequest.kind, "user_input");
+      const card = yield* harness.takeEvent(
+        "turn_item.updated",
+        (event) => event.turnItem.type === "user_input_request",
+      );
+      const questions = card.turnItem.type === "user_input_request" ? card.turnItem.questions : [];
+      assert.strictEqual(questions[0]?.question, "Which database?");
+      assert.deepStrictEqual(
+        questions[0]?.options.map((option) => option.label),
+        ["postgres", "sqlite"],
+      );
       yield* harness.runtime.respondToRuntimeRequest({
         requestId: requested.runtimeRequest.id,
         answers: { answer: "sqlite" },
