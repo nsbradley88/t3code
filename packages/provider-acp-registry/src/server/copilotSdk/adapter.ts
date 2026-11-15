@@ -290,6 +290,7 @@ interface PendingRequest {
     | {
         readonly type: "question";
         readonly id: string;
+        readonly question: string;
         readonly choices: ReadonlyArray<string>;
         readonly allowFreeform: boolean;
         readonly resolve: (value: unknown) => void;
@@ -940,7 +941,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                   {
                     id: "answer",
                     header: "Question",
-                    question: native.id,
+                    question: native.question,
                     options: native.choices.map((label) => ({ label, description: label })),
                     multiSelect: false,
                     allowCustomAnswer: native.allowFreeform,
@@ -1729,6 +1730,7 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
                   return yield* publishRequest({
                     type: "question",
                     id: `${id}`,
+                    question: asString(entry.params.question) ?? "",
                     choices,
                     allowFreeform: entry.params.allowFreeform !== false,
                     resolve: entry.resolve,
