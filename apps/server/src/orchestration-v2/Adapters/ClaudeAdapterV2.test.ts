@@ -11695,6 +11695,99 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // A "now" steer preempts the running step: Claude withdraws an open card and
+  // aborts a running compaction. Steers wait for that step instead.
+  it.effect.each([
+    { blocker: "nothing", priority: "now" },
+    { blocker: "an approval", priority: "next" },
+    { blocker: "a question", priority: "next" },
+    { blocker: "a compaction", priority: "next" },
+  ] as const)("steers with priority $priority while $blocker is pending", ({ blocker, priority }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-steer-priority"),
+          text: "Run the probe.",
+          attachments: [],
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            cwd: "/workspace",
+          }),
+        });
+        yield* harness.runtime.startTurn(input);
+        if (blocker === "an approval" || blocker === "a question") {
+          // @effect-diagnostics-next-line abortControllerInEffect:off - Claude owns the request's signal.
+          const signal = new AbortController().signal;
+          yield* Effect.promise(() =>
+            harness.getOpenedOptions()!.canUseTool!(
+              blocker === "an approval" ? "Bash" : "AskUserQuestion",
+              blocker === "an approval"
+                ? { command: "echo probe" }
+                : {
+                    questions: [
+                      {
+                        header: "Target",
+                        question: "Where should this deploy?",
+                        options: [
+                          { label: "Production", description: "Deploy to production." },
+                          { label: "Staging", description: "Deploy to staging." },
+                        ],
+                        multiSelect: false,
+                      },
+                    ],
+                  },
+              { signal, toolUseID: "toolu_01SteerPriority", requestId: "request-steer-priority" },
+            ),
+          ).pipe(Effect.forkScoped);
+          yield* Queue.take(harness.runtimeRequestReceipts);
+        } else if (blocker === "a compaction") {
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "status",
+              status: "compacting",
+              uuid: "00000000-0000-4000-8000-000000000a01",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+        }
+        yield* harness.runtime.steerTurn({
+          threadId: harness.threadId,
+          runId: input.runId,
+          providerThread: harness.providerThread,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+            nativeTurnId: `turn:${input.attemptId}`,
+          }),
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("steer-priority"),
+            text: "Also check staging.",
+            attachments: [],
+          },
+        });
+        assert.lengthOf(harness.offeredMessages, 2);
+        assert.equal(harness.offeredMessages[1]?.priority, priority);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   it.effect("releases output held for a prompt echo when the stream ends", () =>
     Effect.scoped(
       Effect.gen(function* () {

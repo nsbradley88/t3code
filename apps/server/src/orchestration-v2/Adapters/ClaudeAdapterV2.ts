@@ -11655,9 +11655,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.add(turnInput.providerTurnId);
               return next;
             });
+            // A "now" steer preempts the running step, which withdraws an open
+            // question or approval and aborts a running compaction. "next"
+            // waits for that step to finish and is delivered after it.
+            const steerWaits =
+              (yield* Ref.get(pendingRuntimeRequests)).size > 0 ||
+              (yield* Ref.get(activeTurn))?.compaction?.status === "running";
+            const steerMessage: SDKUserMessage = steerWaits
+              ? { ...userMessage, priority: "next" }
+              : userMessage;
             yield* Effect.uninterruptibleMask((restore) =>
               restore(
-                existing.query.offer(userMessage, () => {
+                existing.query.offer(steerMessage, () => {
                   pdfReservation.commit();
                 }),
               ).pipe(
