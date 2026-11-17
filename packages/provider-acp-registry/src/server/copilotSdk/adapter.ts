@@ -59,6 +59,7 @@ import {
   copilotPermissionModeForRuntimeMode,
   copilotPermissionModeForSelection,
   copilotPickerChoices,
+  copilotSessionOptionsBody,
   copilotToolPresentation,
   type CopilotPermissionRequest,
   type CopilotPermissionMode,
@@ -1835,29 +1836,22 @@ export const makeCopilotSdkAdapterV2 = Effect.fn("makeCopilotSdkAdapterV2")(func
         const mcpSession = yield* mcpSessions.read(args.threadId);
         const effort = copilotPickerChoices(args.modelSelection).reasoningEffort;
         const modelId = copilotModelId(args.modelSelection);
-        return {
-          ...(modelId ? { model: modelId } : {}),
-          ...(effort ? { reasoningEffort: effort } : {}),
+        return copilotSessionOptionsBody(connection.protocolVersion, {
+          model: modelId,
+          reasoningEffort: effort,
           workingDirectory: cwd,
-          streaming: true,
           clientName: "t3code",
-          requestPermission: true,
-          requestUserInput: true,
-          requestExitPlanMode: true,
-          includeSubAgentStreamingEvents: true,
-          ...(mcpSession
+          mcpServers: mcpSession
             ? {
-                mcpServers: {
-                  "t3-code": {
-                    type: "http",
-                    url: mcpSession.endpoint,
-                    headers: { Authorization: mcpSession.authorizationHeader },
-                    tools: ["*"],
-                  },
+                "t3-code": {
+                  type: "http",
+                  url: mcpSession.endpoint,
+                  headers: { Authorization: mcpSession.authorizationHeader },
+                  tools: ["*"],
                 },
               }
-            : {}),
-        };
+            : undefined,
+        });
       });
 
       const register = Effect.fnUntraced(function* (

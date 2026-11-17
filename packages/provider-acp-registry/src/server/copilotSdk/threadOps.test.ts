@@ -113,6 +113,7 @@ const makeFakeServer = Effect.fnUntraced(function* () {
     },
     close: async () => {},
     isClosed: () => false,
+    protocolVersion: 4,
   };
   return {
     connection,

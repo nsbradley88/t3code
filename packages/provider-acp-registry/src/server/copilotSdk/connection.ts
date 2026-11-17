@@ -9,7 +9,8 @@ import type * as NodeStream from "node:stream";
  * this module only moves frames and correlates ids.
  */
 
-const COPILOT_SDK_PROTOCOL_VERSION = 3;
+/** The oldest server protocol the adapter speaks; protocol 4 regrouped the session options. */
+const COPILOT_SDK_MIN_PROTOCOL_VERSION = 3;
 
 // @effect-diagnostics-next-line extendsNativeError:off -- Plain-Promise transport shared with non-Effect callers.
 export class CopilotSdkRpcError extends Error {
@@ -42,6 +43,8 @@ export interface CopilotSdkConnection {
   readonly onClose: (handler: (info: CopilotSdkCloseInfo) => void) => void;
   readonly close: () => Promise<void>;
   readonly isClosed: () => boolean;
+  /** The server's protocol version from `ping`. */
+  readonly protocolVersion: number;
 }
 
 export interface CopilotSdkSpawnInput {
@@ -127,7 +130,7 @@ export function makeFramedConnection(input: {
   readonly kill: () => void;
   readonly stderrTail: () => string;
 }): {
-  readonly connection: CopilotSdkConnection;
+  readonly connection: Omit<CopilotSdkConnection, "protocolVersion">;
   /** Called by the owner once the transport has ended. */
   readonly notifyClosed: (code: number | null, signal: NodeJS.Signals | null) => void;
 } {
@@ -252,7 +255,7 @@ export function makeFramedConnection(input: {
   );
   input.writable.on("error", () => {});
 
-  const connection: CopilotSdkConnection = {
+  const connection: Omit<CopilotSdkConnection, "protocolVersion"> = {
     request: (method, params = {}, options) =>
       new Promise<unknown>((resolve, reject) => {
         if (closed) {
@@ -352,13 +355,16 @@ export async function openCopilotSdkConnection(
       connection.request("ping", {}, { timeoutMs: options.timeoutMs ?? 20_000 }),
       spawnFailed,
     ])) as { readonly protocolVersion?: number } | undefined;
-    if (pong?.protocolVersion === undefined || pong.protocolVersion < COPILOT_SDK_PROTOCOL_VERSION)
+    if (
+      pong?.protocolVersion === undefined ||
+      pong.protocolVersion < COPILOT_SDK_MIN_PROTOCOL_VERSION
+    )
       throw new Error(
-        `Copilot SDK server protocol ${pong?.protocolVersion ?? "unknown"} is older than ${COPILOT_SDK_PROTOCOL_VERSION}; update GitHub Copilot CLI`,
+        `Copilot SDK server protocol ${pong?.protocolVersion ?? "unknown"} is older than ${COPILOT_SDK_MIN_PROTOCOL_VERSION}; update GitHub Copilot CLI`,
       );
+    return { ...connection, protocolVersion: pong.protocolVersion };
   } catch (cause) {
     await connection.close();
     throw cause;
   }
-  return connection;
 }
