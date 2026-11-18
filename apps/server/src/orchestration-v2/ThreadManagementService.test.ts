@@ -873,3 +873,91 @@ it.effect("Force stop refuses once a newer run has started, before killing anyth
     expect(killed).toBe(false);
   }),
 );
+
+it.effect.each([
+  { queuedAhead: false, expected: "steer_active" },
+  // Behind a live run, start_immediately queues: the same path as an auto send with no steerable turn.
+  { queuedAhead: true, expected: "start_immediately" },
+] as const)(
+  "an auto send with queuedAhead=$queuedAhead dispatches $expected",
+  ({ queuedAhead, expected }) => {
+    const projectId = ProjectId.make("project:thread-management:auto-fairness");
+    const threadId = ThreadId.make("thread:thread-management:auto-fairness");
+    const instanceId = ProviderInstanceId.make("claude_work");
+    const activeRunId = RunId.make("run:thread-management:auto-fairness:active");
+    const attemptId = "attempt:thread-management:auto-fairness:active";
+    const messageId = MessageId.make("message:thread-management:auto-fairness:send");
+    const dispatched: Array<OrchestrationV2Command> = [];
+    const runs = [
+      { id: activeRunId, ordinal: 1, status: "running", activeAttemptId: attemptId },
+      ...(queuedAhead
+        ? [
+            {
+              id: RunId.make("run:thread-management:auto-fairness:queued"),
+              ordinal: 2,
+              status: "queued",
+              activeAttemptId: null,
+            },
+          ]
+        : []),
+    ];
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadRecords: () =>
+            Effect.sync(
+              () =>
+                ({
+                  thread: {
+                    id: threadId,
+                    projectId,
+                    deletedAt: null,
+                    archivedAt: null,
+                    modelSelection: { instanceId, model: "test" },
+                  },
+                  runs,
+                  providerTurns: [{ runAttemptId: attemptId, status: "running" }],
+                  messages: [{ id: messageId, runId: activeRunId, role: "user" as const }],
+                  turnItems: [
+                    {
+                      type: "user_message",
+                      messageId,
+                      inputIntent: expected === "steer_active" ? "steer" : "queued_turn",
+                    },
+                  ],
+                }) as unknown as OrchestrationV2ThreadProjection,
+            ),
+          dispatch: (command) =>
+            Effect.sync(() => {
+              dispatched.push(command);
+              return { sequence: 1, storedEvents: [] } as never;
+            }),
+        }),
+      ),
+      Layer.provide(
+        ServerSettings.layerTest({
+          providerInstances: { [instanceId]: { driver: "claudeAgent", enabled: true } },
+        }),
+      ),
+      Layer.provideMerge(layerReceiptsTest),
+    );
+
+    return Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.sendToThread({
+        projectId,
+        commandId: CommandId.make("command:thread-management:auto-fairness:send"),
+        threadId,
+        messageId,
+        text: "Peer report",
+        attachments: [],
+        mode: "auto",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const send = dispatched.find((command) => command.type === "message.dispatch");
+      expect(send).toMatchObject({ dispatchMode: { type: expected } });
+    }).pipe(Effect.provide(layerTest));
+  },
+);

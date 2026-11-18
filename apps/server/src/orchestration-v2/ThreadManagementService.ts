@@ -842,7 +842,13 @@ const make = Effect.gen(function* () {
         type: mode === "steer" ? "steer_active" : "restart_active",
         targetRunId: steerableRun.id,
       };
-    } else if (mode === "auto" && steerableRun !== undefined) {
+    } else if (
+      mode === "auto" &&
+      steerableRun !== undefined &&
+      // An auto send never jumps the queue. Steering past queued runs keeps the
+      // active turn alive while senders keep writing, so the queue never drains.
+      !target.runs.some((run) => run.status === "queued")
+    ) {
       dispatchMode = { type: "steer_active", targetRunId: steerableRun.id };
     } else {
       dispatchMode = {
