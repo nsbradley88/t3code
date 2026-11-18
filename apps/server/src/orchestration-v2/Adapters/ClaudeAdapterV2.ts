@@ -3884,6 +3884,9 @@ export function claudeMcpElicitationAcceptance(
   return { action: "accept", content };
 }
 
+export const CLAUDE_QUESTION_POSTED_MESSAGE =
+  "Your question is posted to the operator and stays open in their UI until they answer. It does not block you: keep working on anything that does not depend on the answer, including messages from other agents. If you cannot go on without it, end your turn. The answer will arrive later as a user message.";
+
 const awaitClaudeUserInputAnswers = Effect.fn("awaitClaudeUserInputAnswers")(function* (
   answers: Deferred.Deferred<ProviderUserInputAnswers>,
   signal: AbortSignal,
@@ -10278,7 +10281,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           toolName: Parameters<CanUseTool>[0],
           toolInput: Parameters<CanUseTool>[1],
           callbackOptions: Parameters<CanUseTool>[2],
-          options?: { readonly startToolCall?: boolean },
+          options?: {
+            readonly startToolCall?: boolean;
+            // Hold the call until the operator answers. Only a control dialog
+            // that needs its answer inline sets this.
+            readonly awaitAnswer?: boolean;
+          },
         ) {
           const context = yield* Ref.get(activeTurn);
           if (context === null) {
@@ -10343,6 +10351,40 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               requestKind: "user_input",
               questions,
             });
+            if (options?.awaitAnswer !== true) {
+              // A question to the operator does not hold the turn. Holding it
+              // would queue every later message, other agents' included, behind
+              // the operator. The card stays open and the orchestrator delivers
+              // the answer as a later message.
+              yield* Effect.all(
+                [
+                  emitProviderEvent({
+                    type: "node.updated",
+                    driver: CLAUDE_PROVIDER,
+                    node: artifacts.node,
+                  }),
+                  emitProviderEvent({
+                    type: "runtime_request.updated",
+                    driver: CLAUDE_PROVIDER,
+                    runtimeRequest: {
+                      ...artifacts.request,
+                      responseCapability: { type: "message" },
+                    },
+                  }),
+                  emitProviderEvent({
+                    type: "turn_item.updated",
+                    driver: CLAUDE_PROVIDER,
+                    turnItem: artifacts.turnItem,
+                  }),
+                ],
+                { concurrency: 1 },
+              );
+              return {
+                behavior: "deny",
+                message: CLAUDE_QUESTION_POSTED_MESSAGE,
+                toolUseID: callbackOptions.toolUseID,
+              } satisfies PermissionResult;
+            }
             const answers = yield* Deferred.make<ProviderUserInputAnswers, never>();
             yield* Ref.update(pendingRuntimeRequests, (current) => {
               const updated = new Map(current);
@@ -10727,7 +10769,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 },
                 // The dialog is a control request, not a tool call, so no
                 // tool_result would ever settle a tool row started for it.
-                { startToolCall: false },
+                { startToolCall: false, awaitAnswer: true },
               );
               if (result.behavior !== "allow") return { behavior: "cancelled" as const };
               const answers =
