@@ -1716,26 +1716,15 @@ describe("ClaudeAdapterV2 resume compaction", () => {
         ) {
           return;
         }
-        yield* runtime.respondToRuntimeRequest({
-          requestId: questionEvent.value.runtimeRequest.id,
-          answers: { [longQuestion]: ["Production", "Staging"] },
+        // The question stays open for the operator without holding the turn:
+        // the answer comes back later as a message.
+        assert.equal(questionEvent.value.runtimeRequest.status, "pending");
+        assert.deepEqual(questionEvent.value.runtimeRequest.responseCapability, {
+          type: "message",
         });
         assert.deepEqual(yield* Fiber.join(questionResult), {
-          behavior: "allow",
-          updatedInput: {
-            questions: [
-              {
-                header: "Target",
-                question: longQuestion,
-                options: [
-                  { label: "Production", description: "Deploy to production." },
-                  { label: "Staging", description: "Deploy to staging." },
-                ],
-                multiSelect: true,
-              },
-            ],
-            answers: { [longQuestion]: "Production, Staging" },
-          },
+          behavior: "deny",
+          message: ClaudeAdapterV2.CLAUDE_QUESTION_POSTED_MESSAGE,
           toolUseID: "tool-question-full-access",
         });
         const longPlan = `# Deployment plan\n\n${"Validate every region before promotion.\n".repeat(120)}`;
@@ -11601,9 +11590,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   it.effect.each([
-    { card: "an approval", toolName: "Bash", toolInput: { command: "echo probe" } },
     {
+      card: "an approval",
+      status: "cancelled",
+      toolName: "Bash",
+      toolInput: { command: "echo probe" },
+    },
+    {
+      // A question never holds the turn, so withdrawing the tool call leaves
+      // it open for the operator.
       card: "a question",
+      status: "pending",
       toolName: "AskUserQuestion",
       toolInput: {
         questions: [
@@ -11619,80 +11616,85 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ],
       },
     },
-  ])("closes $card card when Claude withdraws its request", ({ toolName, toolInput }) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const harness = yield* makeWakeHarness;
-        yield* harness.runtime.startTurn(
-          makeClaudeTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now: yield* DateTime.now,
-            attemptId: RunAttemptId.make("attempt-claude-withdrawn-approval"),
-            text: "Run the probe.",
-            attachments: [],
-            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-              runtimeMode: "approval-required",
-              interactionMode: "default",
-              cwd: "/workspace",
+  ])(
+    "leaves $card card $status when Claude withdraws its request",
+    ({ status, toolName, toolInput }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt-claude-withdrawn-approval"),
+              text: "Run the probe.",
+              attachments: [],
+              runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+                cwd: "/workspace",
+              }),
             }),
-          }),
-        );
-        // The CLI cancels a request once a PermissionRequest hook has answered it.
-        // @effect-diagnostics-next-line abortControllerInEffect:off - Claude, not the test fiber, withdraws the request.
-        const withdrawal = new AbortController();
-        const permission = yield* Effect.promise(() =>
-          harness.getOpenedOptions()!.canUseTool!(toolName, toolInput, {
-            signal: withdrawal.signal,
-            toolUseID: "toolu_01WithdrawnApproval",
-            requestId: "request-withdrawn-approval",
-          }),
-        ).pipe(Effect.forkScoped);
-        const pending = (yield* Queue.take(harness.runtimeRequestReceipts)).runtimeRequest;
-        assert.equal(pending.status, "pending");
+          );
+          // The CLI cancels a request once a PermissionRequest hook has answered it.
+          // @effect-diagnostics-next-line abortControllerInEffect:off - Claude, not the test fiber, withdraws the request.
+          const withdrawal = new AbortController();
+          const permission = yield* Effect.promise(() =>
+            harness.getOpenedOptions()!.canUseTool!(toolName, toolInput, {
+              signal: withdrawal.signal,
+              toolUseID: "toolu_01WithdrawnApproval",
+              requestId: "request-withdrawn-approval",
+            }),
+          ).pipe(Effect.forkScoped);
+          const pending = (yield* Queue.take(harness.runtimeRequestReceipts)).runtimeRequest;
+          assert.equal(pending.status, "pending");
 
-        // The turn can end right after the withdrawal, before the callback returns.
-        withdrawal.abort();
-        yield* Queue.offer(
-          harness.sdkMessages,
-          claudeSdkFrame({
-            ...makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000790", result: "Done." }),
-            user_message_uuid: harness.promptUuid(0),
-          }),
-        );
-        yield* harness.awaitTerminal(1);
-        assert.equal((yield* Fiber.join(permission))?.behavior, "deny");
-        // The cancellation has to land before the turn's end finalizes the run.
-        const beforeTerminal = harness.events.slice(
-          0,
-          harness.events.findIndex((event) => event.type === "turn.terminal"),
-        );
-        const statusOf = (type: "runtime_request.updated" | "node.updated" | "turn_item.updated") =>
-          beforeTerminal
-            .flatMap((event): Array<{ readonly type: string; readonly status: string }> =>
-              event.type === "runtime_request.updated" && event.runtimeRequest.id === pending.id
-                ? [{ type: event.type, status: event.runtimeRequest.status }]
-                : event.type === "node.updated" && event.node.id === pending.nodeId
-                  ? [{ type: event.type, status: event.node.status }]
-                  : event.type === "turn_item.updated" && event.turnItem.nodeId === pending.nodeId
-                    ? [{ type: event.type, status: event.turnItem.status }]
-                    : [],
-            )
-            .findLast((entry) => entry.type === type)?.status;
-        assert.equal(statusOf("runtime_request.updated"), "cancelled");
-        assert.equal(statusOf("node.updated"), "cancelled");
-        assert.equal(statusOf("turn_item.updated"), "cancelled");
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
+          // The turn can end right after the withdrawal, before the callback returns.
+          withdrawal.abort();
+          yield* Queue.offer(
+            harness.sdkMessages,
+            claudeSdkFrame({
+              ...makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000790", result: "Done." }),
+              user_message_uuid: harness.promptUuid(0),
+            }),
+          );
+          yield* harness.awaitTerminal(1);
+          assert.equal((yield* Fiber.join(permission))?.behavior, "deny");
+          // The cancellation has to land before the turn's end finalizes the run.
+          const beforeTerminal = harness.events.slice(
+            0,
+            harness.events.findIndex((event) => event.type === "turn.terminal"),
+          );
+          const statusOf = (
+            type: "runtime_request.updated" | "node.updated" | "turn_item.updated",
+          ) =>
+            beforeTerminal
+              .flatMap((event): Array<{ readonly type: string; readonly status: string }> =>
+                event.type === "runtime_request.updated" && event.runtimeRequest.id === pending.id
+                  ? [{ type: event.type, status: event.runtimeRequest.status }]
+                  : event.type === "node.updated" && event.node.id === pending.nodeId
+                    ? [{ type: event.type, status: event.node.status }]
+                    : event.type === "turn_item.updated" && event.turnItem.nodeId === pending.nodeId
+                      ? [{ type: event.type, status: event.turnItem.status }]
+                      : [],
+              )
+              .findLast((entry) => entry.type === type)?.status;
+          assert.equal(statusOf("runtime_request.updated"), status);
+          const cardStatus = status === "pending" ? "waiting" : status;
+          assert.equal(statusOf("node.updated"), cardStatus);
+          assert.equal(statusOf("turn_item.updated"), cardStatus);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
           ),
         ),
       ),
-    ),
   );
 
   // A "now" steer preempts the running step: Claude withdraws an open card and
@@ -11700,7 +11702,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   it.effect.each([
     { blocker: "nothing", priority: "now" },
     { blocker: "an approval", priority: "next" },
-    { blocker: "a question", priority: "next" },
+    // A question is posted without holding the turn, so it does not delay a steer.
+    { blocker: "a question", priority: "now" },
     { blocker: "a compaction", priority: "next" },
   ] as const)("steers with priority $priority while $blocker is pending", ({ blocker, priority }) =>
     Effect.scoped(
