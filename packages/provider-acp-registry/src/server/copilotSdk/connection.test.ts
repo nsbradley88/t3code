@@ -153,7 +153,7 @@ describe("Copilot SDK connection", () => {
 
   it("opens against a conforming server and closes its process", async () => {
     const script =
-      "process.stdin.on('data',()=>{const b=JSON.stringify({jsonrpc:'2.0',id:1,result:{message:'pong',protocolVersion:3}});" +
+      "process.stdin.on('data',()=>{const b=JSON.stringify({jsonrpc:'2.0',id:1,result:{message:'pong',protocolVersion:4}});" +
       "process.stdout.write('Content-Length: '+Buffer.byteLength(b)+'\\r\\n\\r\\n'+b)});setInterval(()=>{},1000)";
     const connection = await openCopilotSdkConnection({
       command: NodeProcess.execPath,
@@ -163,6 +163,7 @@ describe("Copilot SDK connection", () => {
       platform: "linux",
     });
     assert.strictEqual(connection.isClosed(), false);
+    assert.strictEqual(connection.protocolVersion, 4);
     await connection.close();
     assert.strictEqual(connection.isClosed(), true);
   });

@@ -242,3 +242,46 @@ export function copilotToolPresentation(input: {
   }
   return { ...shared, type: "dynamic_tool", toolName, input: args ?? {}, output };
 }
+
+/** The `session.create` / `session.resume` options T3 sets, independent of protocol layout. */
+export interface CopilotSessionOptions {
+  readonly model: string | undefined;
+  readonly reasoningEffort: string | undefined;
+  readonly workingDirectory: string;
+  readonly clientName: string;
+  readonly mcpServers: Record<string, unknown> | undefined;
+}
+
+/**
+ * Lays the options out for the server's protocol. Protocol 4 (Copilot CLI 1.0.113) moved them
+ * into groups and rejects the flat names; protocol 3 servers ignore the groups.
+ */
+export function copilotSessionOptionsBody(
+  protocolVersion: number,
+  options: CopilotSessionOptions,
+): Record<string, unknown> {
+  const common = {
+    ...(options.model ? { model: options.model } : {}),
+    workingDirectory: options.workingDirectory,
+    clientName: options.clientName,
+  };
+  if (protocolVersion < 4)
+    return {
+      ...common,
+      ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+      streaming: true,
+      requestPermission: true,
+      requestUserInput: true,
+      requestExitPlanMode: true,
+      includeSubAgentStreamingEvents: true,
+      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
+    };
+  return {
+    ...common,
+    ...(options.reasoningEffort ? { inference: { reasoningEffort: options.reasoningEffort } } : {}),
+    events: { streaming: true, includeSubAgentStreamingEvents: true },
+    permissions: { request: true },
+    interaction: { requestUserInput: true, requestExitPlanMode: true },
+    ...(options.mcpServers ? { mcp: { servers: options.mcpServers } } : {}),
+  };
+}

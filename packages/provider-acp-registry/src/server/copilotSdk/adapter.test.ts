@@ -62,7 +62,7 @@ interface Call {
 }
 
 /** An in-memory stand-in for `copilot --headless --stdio`. */
-const makeFakeServer = Effect.fnUntraced(function* () {
+const makeFakeServer = Effect.fnUntraced(function* (protocolVersion = 4) {
   const calls: Call[] = [];
   const requests = yield* Queue.unbounded<Call>();
   const responses = new Map<string, Array<unknown>>();
@@ -105,6 +105,7 @@ const makeFakeServer = Effect.fnUntraced(function* () {
     },
     close: async () => {},
     isClosed: () => false,
+    protocolVersion,
   };
   return {
     connection,
@@ -267,36 +268,61 @@ describe("CopilotSdkAdapterV2", () => {
     assert.strictEqual(CopilotSdkCapabilitiesV2.sessions.supportsRuntimeModeSwitchInSession, true);
   });
 
-  it.live("creates a streaming session with the thread's MCP credential and allow-all", () =>
-    Effect.gen(function* () {
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
-        environmentId: EnvironmentId.make("test-environment"),
-        threadId: THREAD_ID,
-        providerSessionId: "test-session",
-        providerInstanceId: INSTANCE_ID,
-        endpoint: "http://127.0.0.1:43210/mcp",
-        authorizationHeader: "Bearer thread-token",
-        browserToolsAvailable: true,
-      });
-      const fake = yield* makeFakeServer();
-      yield* makeHarness(fake);
-      const create = fake.named("session.create")[0]!;
-      assert.strictEqual(create.params.model, MODEL);
-      assert.strictEqual(create.params.streaming, true);
-      assert.strictEqual(create.params.requestPermission, true);
-      assert.deepStrictEqual(create.params.mcpServers, {
-        "t3-code": {
-          type: "http",
-          url: "http://127.0.0.1:43210/mcp",
-          headers: { Authorization: "Bearer thread-token" },
-          tools: ["*"],
-        },
-      });
-      assert.deepStrictEqual(
-        fake.named("session.permissions.setMode")[0]?.params.mode,
-        "allow-all",
-      );
-    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  it.live.each([3, 4])(
+    "creates a streaming session with the thread's MCP credential and allow-all (protocol %i)",
+    (protocolVersion) =>
+      Effect.gen(function* () {
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          environmentId: EnvironmentId.make("test-environment"),
+          threadId: THREAD_ID,
+          providerSessionId: "test-session",
+          providerInstanceId: INSTANCE_ID,
+          endpoint: "http://127.0.0.1:43210/mcp",
+          authorizationHeader: "Bearer thread-token",
+          browserToolsAvailable: true,
+        });
+        const fake = yield* makeFakeServer(protocolVersion);
+        yield* makeHarness(fake, fullAccess, {
+          ...selection,
+          options: [{ id: "reasoning_effort", value: "high" }],
+        });
+        const create = fake.named("session.create")[0]!.params;
+        const mcpServers = {
+          "t3-code": {
+            type: "http",
+            url: "http://127.0.0.1:43210/mcp",
+            headers: { Authorization: "Bearer thread-token" },
+            tools: ["*"],
+          },
+        };
+        assert.strictEqual(create.model, MODEL);
+        assert.strictEqual(create.workingDirectory !== undefined, true);
+        // Protocol 4 (Copilot CLI 1.0.113) groups these options and rejects the flat names.
+        if (protocolVersion >= 4) {
+          assert.deepStrictEqual(create.inference, { reasoningEffort: "high" });
+          assert.deepStrictEqual(create.events, {
+            streaming: true,
+            includeSubAgentStreamingEvents: true,
+          });
+          assert.deepStrictEqual(create.permissions, { request: true });
+          assert.deepStrictEqual(create.interaction, {
+            requestUserInput: true,
+            requestExitPlanMode: true,
+          });
+          assert.deepStrictEqual(create.mcp, { servers: mcpServers });
+          for (const flat of ["reasoningEffort", "streaming", "requestPermission", "mcpServers"])
+            assert.strictEqual(flat in create, false, flat);
+        } else {
+          assert.strictEqual(create.reasoningEffort, "high");
+          assert.strictEqual(create.streaming, true);
+          assert.strictEqual(create.requestPermission, true);
+          assert.deepStrictEqual(create.mcpServers, mcpServers);
+        }
+        assert.deepStrictEqual(
+          fake.named("session.permissions.setMode")[0]?.params.mode,
+          "allow-all",
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.live("lets Copilot choose its own model for the default placeholder", () =>
