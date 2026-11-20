@@ -915,3 +915,77 @@ it.effect("a run interrupted right after it reserves the task does not block the
     }).pipe(Effect.provide(layer));
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
+
+it.effect.each([
+  { queuedFrom: "this task", sends: 0 },
+  { queuedFrom: "another task", sends: 1 },
+  { queuedFrom: "nothing", sends: 1 },
+] as const)(
+  "a bound run with $queuedFrom queued on the thread sends $sends prompts",
+  ({ queuedFrom, sends: expectedSends }) =>
+    Effect.gen(function* () {
+      const taskId = ScheduledTaskId.make("task:queued-fire");
+      const threadId = ThreadId.make("thread:queued-fire");
+      const sends = yield* Ref.make(0);
+      const layer = ScheduledTaskService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ManagedPolicy.layerTest(),
+            Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadShell: () => Effect.succeed(threadShell(ProjectId.make("project:test"))),
+              getThreadRecords: ((_threadId: ThreadId, fields: ReadonlyArray<string>) =>
+                Effect.succeed(
+                  (fields.includes("runs")
+                    ? {
+                        runs:
+                          queuedFrom === "nothing"
+                            ? []
+                            : [{ status: "queued", userMessageId: "message:queued-fire" }],
+                      }
+                    : {
+                        messages: [
+                          {
+                            id: "message:queued-fire",
+                            scheduledTaskId:
+                              queuedFrom === "this task"
+                                ? taskId
+                                : ScheduledTaskId.make("task:other"),
+                          },
+                        ],
+                      }) as never,
+                )) as never,
+              sendToThread: () => Ref.update(sends, (n) => n + 1).pipe(Effect.as({} as never)),
+            }),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+              namedProjectsRoot: "/projects",
+              isScratchProject: () => Effect.succeed(false),
+            }),
+            NodeCrypto.layer,
+            Layer.succeed(Scheduler.Scheduler, { register: () => Effect.void }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ScheduledTaskService.ScheduledTaskService;
+        yield* service.upsert({
+          id: taskId,
+          title: "Check in",
+          prompt: "Check progress",
+          enabled: true,
+          schedule: { type: "interval", everyMs: 60_000 },
+          projectId: ProjectId.make("project:test"),
+          threadId,
+          workspaceStrategy: { type: "root" },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        });
+        const result = yield* service.runNow({ id: taskId });
+        assert.equal(result.threadId, threadId);
+        assert.equal(result.task.lastRunStatus, "succeeded");
+        assert.equal(yield* Ref.get(sends), expectedSends);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
