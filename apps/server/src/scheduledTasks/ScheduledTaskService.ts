@@ -971,42 +971,64 @@ export const layer = Layer.effect(
               }),
             );
 
+        // A fire whose previous prompt is still queued on the thread would only queue the
+        // same prompt again. A busy thread then works through stale copies one turn each.
+        const previousFireQueued = Effect.fn("previousFireQueued")(
+          function* (threadId: ThreadId) {
+            const { runs } = yield* threadManagement.getThreadRecords(threadId, ["runs"]);
+            const queuedMessageIds = runs
+              .filter((run) => run.status === "queued")
+              .map((run) => run.userMessageId);
+            if (queuedMessageIds.length === 0) return false;
+            const { messages } = yield* threadManagement.getThreadRecords(threadId, ["messages"], {
+              messageIds: queuedMessageIds,
+            });
+            return messages.some((message) => message.scheduledTaskId === active.id);
+          },
+          // Reading the queue only saves a duplicate; failing to read must not drop the fire.
+          Effect.catchCause(() => Effect.succeed(false)),
+        );
+
         // Capture defects and interrupts too so dispatch failures still reach markCompleted.
         const result =
-          active.threadId === null
-            ? yield* Effect.exit(
-                threadLaunch
-                  .launch({
-                    commandId,
-                    projectId: active.projectId,
-                    title: active.title,
-                    modelSelection: active.modelSelection,
-                    runtimeMode: active.runtimeMode,
-                    interactionMode: active.interactionMode,
-                    workspaceStrategy: active.workspaceStrategy,
-                    initialMessage: {
-                      messageId,
-                      scheduledTaskId: active.id,
-                      text: prompt,
-                      attachments: [],
-                    },
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
-                  })
-                  .pipe(
-                    Effect.map((launched) => launched.threadId),
-                    Effect.tap((threadId) =>
-                      threadMode === "new_thread" ? Effect.void : bindThread(active, threadId),
+          active.threadId !== null &&
+          webhook === undefined &&
+          (yield* previousFireQueued(ThreadId.make(active.threadId)))
+            ? Exit.succeed(ThreadId.make(active.threadId))
+            : active.threadId === null
+              ? yield* Effect.exit(
+                  threadLaunch
+                    .launch({
+                      commandId,
+                      projectId: active.projectId,
+                      title: active.title,
+                      modelSelection: active.modelSelection,
+                      runtimeMode: active.runtimeMode,
+                      interactionMode: active.interactionMode,
+                      workspaceStrategy: active.workspaceStrategy,
+                      initialMessage: {
+                        messageId,
+                        scheduledTaskId: active.id,
+                        text: prompt,
+                        attachments: [],
+                      },
+                      createdBy: active.createdBy,
+                      creationSource: active.creationSource,
+                    })
+                    .pipe(
+                      Effect.map((launched) => launched.threadId),
+                      Effect.tap((threadId) =>
+                        threadMode === "new_thread" ? Effect.void : bindThread(active, threadId),
+                      ),
                     ),
+                )
+              : yield* Effect.exit(
+                  // The stored selection only seeds fresh threads. A bound run
+                  // follows the thread's current provider, so it passes none.
+                  sendBound(ThreadId.make(active.threadId), active.projectId, 2).pipe(
+                    Effect.as(ThreadId.make(active.threadId)),
                   ),
-              )
-            : yield* Effect.exit(
-                // The stored selection only seeds fresh threads. A bound run
-                // follows the thread's current provider, so it passes none.
-                sendBound(ThreadId.make(active.threadId), active.projectId, 2).pipe(
-                  Effect.as(ThreadId.make(active.threadId)),
-                ),
-              );
+                );
 
         const runSucceeded = result._tag === "Success";
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
